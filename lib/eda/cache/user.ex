@@ -8,6 +8,7 @@ defmodule EDA.Cache.User do
   use GenServer
 
   @table :eda_users
+  @cache_name :users
 
   # Client API
 
@@ -21,8 +22,13 @@ defmodule EDA.Cache.User do
   @spec get(String.t() | integer()) :: map() | nil
   def get(user_id) do
     case :ets.lookup(@table, to_string(user_id)) do
-      [{_, user}] -> user
-      [] -> nil
+      [{_, user}] ->
+        :telemetry.execute([:eda, :cache, :hit], %{count: 1}, %{cache: @cache_name})
+        user
+
+      [] ->
+        :telemetry.execute([:eda, :cache, :miss], %{count: 1}, %{cache: @cache_name})
+        nil
     end
   end
 
@@ -41,8 +47,18 @@ defmodule EDA.Cache.User do
   @spec create(map()) :: map()
   def create(user) do
     user_id = to_string(user["id"])
-    :ets.insert(@table, {user_id, user})
-    user
+
+    case EDA.Cache.Policy.check(EDA.Cache.Config.policy(@cache_name), :user, user_id, user) do
+      :cache ->
+        :ets.insert(@table, {user_id, user})
+        EDA.Cache.Evictor.touch(@table, user_id)
+        :telemetry.execute([:eda, :cache, :write], %{count: 1}, %{cache: @cache_name})
+        user
+
+      :skip ->
+        :telemetry.execute([:eda, :cache, :skip], %{count: 1}, %{cache: @cache_name})
+        user
+    end
   end
 
   @doc """
@@ -68,7 +84,9 @@ defmodule EDA.Cache.User do
   """
   @spec delete(String.t() | integer()) :: :ok
   def delete(user_id) do
-    :ets.delete(@table, to_string(user_id))
+    key = to_string(user_id)
+    :ets.delete(@table, key)
+    EDA.Cache.Evictor.remove(@table, key)
     :ok
   end
 

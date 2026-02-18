@@ -7,16 +7,23 @@ defmodule EDA.Gateway.Heartbeat do
   """
 
   @doc """
-  Starts the heartbeat timer.
+  Schedules the first heartbeat after HELLO.
 
-  Returns a reference that can be used to cancel the timer.
-  Adds jitter to prevent thundering herd.
+  Per Discord docs, the first heartbeat should be sent after
+  `interval * jitter` where jitter is between 0 and 1.
+  """
+  @spec start_first(integer()) :: reference()
+  def start_first(interval) do
+    delay = trunc(interval * :rand.uniform())
+    Process.send_after(self(), {:heartbeat}, delay)
+  end
+
+  @doc """
+  Schedules the next heartbeat at a fixed interval.
   """
   @spec start(integer()) :: reference()
   def start(interval) do
-    # Add jitter (0-10% of interval)
-    jitter = :rand.uniform(div(interval, 10))
-    Process.send_after(self(), {:heartbeat}, interval + jitter)
+    Process.send_after(self(), {:heartbeat}, interval)
   end
 
   @doc """

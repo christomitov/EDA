@@ -100,17 +100,18 @@ defmodule EDA.Gateway.EventsTest do
       assert user["username"] == "author"
     end
 
-    test "handles READY with guilds and user" do
+    test "handles READY — caches user but not guild stubs" do
       ready_data = %{
         "user" => %{"id" => "bot_id", "username" => "TestBot"},
         "guilds" => [
-          %{"id" => "evt_rg1", "name" => "Ready Guild"}
+          %{"id" => "evt_rg1", "name" => "Ready Guild", "unavailable" => true}
         ]
       }
 
       Events.dispatch("READY", ready_data)
 
-      assert EDA.Cache.Guild.get("evt_rg1") != nil
+      # Guild stubs from READY are incomplete — not cached until GUILD_CREATE
+      assert EDA.Cache.Guild.get("evt_rg1") == nil
       assert EDA.Cache.User.get("bot_id") != nil
     end
 
@@ -118,14 +119,35 @@ defmodule EDA.Gateway.EventsTest do
       assert :ok = Events.dispatch("UNKNOWN_EVENT", %{"foo" => "bar"})
     end
 
-    test "dispatches to consumer when configured" do
+    test "dispatches to consumer with typed struct" do
       Process.register(self(), :events_test_consumer)
 
       Application.put_env(:eda, :consumer, EDA.Gateway.EventsTest.TestConsumer)
 
-      Events.dispatch("TEST_EVENT", %{"data" => "test"})
+      Events.dispatch("MESSAGE_CREATE", %{
+        "id" => "msg1",
+        "channel_id" => "ch1",
+        "content" => "hello"
+      })
 
-      assert_receive {:event, {:TEST_EVENT, %{"data" => "test"}}}, 1000
+      assert_receive {:event, {:MESSAGE_CREATE, %EDA.Event.MessageCreate{} = msg}}, 1000
+      assert msg.id == "msg1"
+      assert msg.content == "hello"
+      assert msg["channel_id"] == "ch1"
+
+      Application.delete_env(:eda, :consumer)
+    end
+
+    test "dispatches unknown event as Raw struct" do
+      Process.register(self(), :events_test_consumer)
+
+      Application.put_env(:eda, :consumer, EDA.Gateway.EventsTest.TestConsumer)
+
+      Events.dispatch("UNKNOWN_NEW_EVENT", %{"foo" => "bar"})
+
+      assert_receive {:event, {:UNKNOWN_NEW_EVENT, %EDA.Event.Raw{} = raw}}, 1000
+      assert raw.event_type == "UNKNOWN_NEW_EVENT"
+      assert raw.data.foo == "bar"
 
       Application.delete_env(:eda, :consumer)
     end
@@ -133,6 +155,67 @@ defmodule EDA.Gateway.EventsTest do
     test "handles missing consumer gracefully" do
       Application.delete_env(:eda, :consumer)
       assert :ok = Events.dispatch("SOME_EVENT", %{})
+    end
+  end
+
+  describe "guild unavailability" do
+    test "GUILD_DELETE with unavailable: true dispatches GUILD_UNAVAILABLE and preserves cache" do
+      Process.register(self(), :events_test_consumer)
+      Application.put_env(:eda, :consumer, EDA.Gateway.EventsTest.TestConsumer)
+
+      EDA.Cache.Guild.create(%{"id" => "unavail_g1", "name" => "Test Guild"})
+
+      Events.dispatch("GUILD_DELETE", %{"id" => "unavail_g1", "unavailable" => true})
+
+      assert_receive {:event, {:GUILD_UNAVAILABLE, %EDA.Event.GuildDelete{} = evt}}, 1000
+      assert evt.id == "unavail_g1"
+      assert evt.unavailable == true
+
+      # Cache should NOT be purged
+      guild = EDA.Cache.Guild.get("unavail_g1")
+      assert guild != nil
+      assert guild["unavailable"] == true
+
+      Application.delete_env(:eda, :consumer)
+    end
+
+    test "GUILD_DELETE without unavailable dispatches GUILD_DELETE and purges cache" do
+      Process.register(self(), :events_test_consumer)
+      Application.put_env(:eda, :consumer, EDA.Gateway.EventsTest.TestConsumer)
+
+      EDA.Cache.Guild.create(%{"id" => "leave_g1", "name" => "Leaving Guild"})
+
+      Events.dispatch("GUILD_DELETE", %{"id" => "leave_g1"})
+
+      assert_receive {:event, {:GUILD_DELETE, %EDA.Event.GuildDelete{}}}, 1000
+
+      # Cache should be purged
+      assert EDA.Cache.Guild.get("leave_g1") == nil
+
+      Application.delete_env(:eda, :consumer)
+    end
+
+    test "GUILD_CREATE after unavailable dispatches GUILD_AVAILABLE" do
+      Process.register(self(), :events_test_consumer)
+      Application.put_env(:eda, :consumer, EDA.Gateway.EventsTest.TestConsumer)
+
+      # Mark guild as unavailable
+      :ets.insert(:eda_unavailable_guilds, {"recovery_g1"})
+
+      Events.dispatch("GUILD_CREATE", %{
+        "id" => "recovery_g1",
+        "name" => "Recovered Guild",
+        "channels" => [],
+        "members" => []
+      })
+
+      assert_receive {:event, {:GUILD_AVAILABLE, %EDA.Event.GuildCreate{} = evt}}, 1000
+      assert evt.id == "recovery_g1"
+
+      # Should be removed from unavailable set
+      refute :ets.member(:eda_unavailable_guilds, "recovery_g1")
+
+      Application.delete_env(:eda, :consumer)
     end
   end
 

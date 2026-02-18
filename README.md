@@ -1,19 +1,25 @@
 # EDA - Elixir Discord API
 
-A modern Discord library for Elixir, inspired by JDA (Java Discord API).
+[![CI](https://github.com/qoyri/EDA/actions/workflows/ci.yml/badge.svg)](https://github.com/qoyri/EDA/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/eda.svg)](https://hex.pm/packages/eda)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/eda)
+[![License: MIT](https://img.shields.io/hexpm/l/eda.svg)](https://opensource.org/licenses/MIT)
 
-## Features
+A complete, production-grade Discord library for Elixir. 21 API modules, 68+ event types, full voice with E2EE, automatic sharding, and 1200+ tests.
 
-- **WebSocket Gateway** - Real-time connection to Discord with automatic reconnection
-- **REST API Client** - Full Discord REST API support with rate limiting
-- **ETS Caching** - Fast O(1) lookups for guilds, users, and channels
-- **Simple Consumer Pattern** - Easy event handling with pattern matching
-- **OTP-Native** - Built on GenServers and Supervisors for reliability
-- **Telemetry Integration** - Built-in observability
+## Why EDA?
+
+- **Full Discord API coverage** — 21 resource-based REST modules: messages, guilds, channels, members, roles, commands, interactions, webhooks, threads, stages, polls, stickers, emojis, scheduled events, auto-moderation, and more
+- **Typed event structs** — 68+ gateway events across 7 categories (Guild, Message, Channel, Voice, Thread, Stage, Invite) with pattern matching, not raw maps
+- **Voice with encryption** — Opus audio send/receive, OGG playback, AES-256-GCM and XChaCha20-Poly1305 encryption, plus experimental DAVE (Discord E2EE) via Rust NIF
+- **Smart sharding** — Auto shard count from `/gateway/bot`, staggered startup respecting `max_concurrency`, per-shard ready tracking, exponential backoff with jitter
+- **Configurable cache** — ETS-backed O(1) lookups for 7 entity types (guilds, channels, users, members, roles, presences, voice states) with admission policies and LRW eviction
+- **ETF + zlib** — Binary ETF encoding and zlib-stream compression for lower bandwidth and faster deserialization
+- **23 entity structs** — First-class structs with `Access` behaviour for all Discord objects
+- **Telemetry built-in** — Instrument gateway, HTTP, and cache operations out of the box
+- **OTP-native** — Supervised GenServers, DynamicSupervisors, and proper fault tolerance
 
 ## Installation
-
-Add `eda` to your dependencies in `mix.exs`:
 
 ```elixir
 def deps do
@@ -38,30 +44,19 @@ config :eda,
 ### 2. Create a consumer
 
 ```elixir
-# lib/my_bot/consumer.ex
 defmodule MyBot.Consumer do
   @behaviour EDA.Consumer
 
-  require Logger
-
   @impl true
   def handle_event({:MESSAGE_CREATE, msg}) do
-    case msg["content"] do
-      "!ping" ->
-        EDA.REST.Client.create_message(msg["channel_id"], "Pong!")
-
-      "!hello" ->
-        author = msg["author"]["username"]
-        EDA.REST.Client.create_message(msg["channel_id"], "Hello, #{author}!")
-
-      _ ->
-        :ignore
+    if msg.content == "!ping" do
+      EDA.API.Message.create(msg.channel_id, "Pong!")
     end
   end
 
   @impl true
-  def handle_event({:READY, data}) do
-    Logger.info("Bot ready as #{data["user"]["username"]}!")
+  def handle_event({:READY, ready}) do
+    IO.puts("Online as #{ready.user.username}!")
   end
 
   @impl true
@@ -69,158 +64,113 @@ defmodule MyBot.Consumer do
 end
 ```
 
-### 3. Run your bot
+### 3. Run
 
 ```bash
-export DISCORD_TOKEN="your_bot_token_here"
-iex -S mix
+DISCORD_TOKEN="your_token" iex -S mix
 ```
-
-## Gateway Intents
-
-Control which events your bot receives:
-
-```elixir
-config :eda,
-  intents: [:guilds, :guild_messages, :message_content]
-```
-
-Available intents:
-- `:guilds` - Guild events
-- `:guild_members` - Member events (privileged)
-- `:guild_moderation` - Ban/unban events
-- `:guild_expressions` - Emoji/sticker events
-- `:guild_integrations` - Integration events
-- `:guild_webhooks` - Webhook events
-- `:guild_invites` - Invite events
-- `:guild_voice_states` - Voice state events
-- `:guild_presences` - Presence updates (privileged)
-- `:guild_messages` - Message events in guilds
-- `:guild_message_reactions` - Reaction events in guilds
-- `:guild_message_typing` - Typing events in guilds
-- `:direct_messages` - DM events
-- `:direct_message_reactions` - Reaction events in DMs
-- `:direct_message_typing` - Typing events in DMs
-- `:message_content` - Access message content (privileged)
-- `:guild_scheduled_events` - Scheduled event events
-- `:auto_moderation_configuration` - AutoMod config events
-- `:auto_moderation_execution` - AutoMod execution events
-
-Shortcuts:
-- `:all` - All intents including privileged
-- `:nonprivileged` - All non-privileged intents
 
 ## REST API
 
-Send messages and interact with Discord:
-
 ```elixir
-# Send a message
-EDA.REST.Client.create_message(channel_id, "Hello!")
+# Messages
+EDA.API.Message.create(channel_id, "Hello!")
+EDA.API.Message.create(channel_id, content: "With embed", embeds: [%{title: "Hey", color: 0x5865F2}])
 
-# Send a message with an embed
-EDA.REST.Client.create_message(channel_id, %{
-  content: "Check this out!",
-  embeds: [%{
-    title: "Cool Embed",
-    description: "Very nice",
-    color: 0x5865F2
-  }]
-})
+# Guilds & members
+{:ok, guild} = EDA.API.Guild.get(guild_id)
+{:ok, member} = EDA.API.Member.get(guild_id, user_id)
+EDA.API.Role.add(guild_id, user_id, role_id)
 
-# Get guild info
-{:ok, guild} = EDA.REST.Client.get_guild(guild_id)
+# Slash commands
+EDA.API.Command.create_global(app_id, %{name: "ping", description: "Pong!"})
 
-# Add a reaction
-EDA.REST.Client.create_reaction(channel_id, message_id, "👍")
+# Reactions, threads, webhooks...
+EDA.API.Reaction.create(channel_id, message_id, "🔥")
+EDA.API.Thread.create(channel_id, %{name: "Discussion", auto_archive_duration: 1440})
 ```
 
-## Caching
-
-Access cached data with O(1) lookups:
+## Cache
 
 ```elixir
-# Get the bot user
-me = EDA.Cache.me()
+EDA.Cache.me()                              # Bot user
+EDA.Cache.get_guild(guild_id)               # Single guild
+EDA.Cache.guilds()                          # All guilds
+EDA.Cache.get_channel(channel_id)           # Single channel
+EDA.Cache.channels_for_guild(guild_id)      # Guild channels
+EDA.Cache.guild_count()                     # Stats
+```
 
-# Get a guild
-guild = EDA.Cache.get_guild(guild_id)
+Configure cache admission per entity:
 
-# Get all guilds
-guilds = EDA.Cache.guilds()
-
-# Get a user
-user = EDA.Cache.get_user(user_id)
-
-# Get a channel
-channel = EDA.Cache.get_channel(channel_id)
-
-# Get channels for a guild
-channels = EDA.Cache.channels_for_guild(guild_id)
-
-# Cache stats
-EDA.Cache.guild_count()
-EDA.Cache.user_count()
-EDA.Cache.channel_count()
+```elixir
+config :eda, :cache,
+  policy: :all,           # :all | :none | MyPolicy | fn/3
+  max_size: 10_000,       # Enable LRW eviction
+  evict_interval: 60_000  # Eviction check interval (ms)
 ```
 
 ## Events
 
-Common events you can handle:
-
 | Event | Description |
 |-------|-------------|
-| `{:READY, data}` | Bot has connected and is ready |
-| `{:MESSAGE_CREATE, msg}` | A message was created |
-| `{:MESSAGE_UPDATE, msg}` | A message was edited |
-| `{:MESSAGE_DELETE, data}` | A message was deleted |
-| `{:GUILD_CREATE, guild}` | Bot joined a guild |
-| `{:GUILD_DELETE, data}` | Bot left a guild |
-| `{:CHANNEL_CREATE, channel}` | A channel was created |
-| `{:CHANNEL_UPDATE, channel}` | A channel was updated |
-| `{:CHANNEL_DELETE, channel}` | A channel was deleted |
-| `{:INTERACTION_CREATE, interaction}` | Slash command or component interaction |
+| `{:MESSAGE_CREATE, msg}` | Message created |
+| `{:INTERACTION_CREATE, interaction}` | Slash command / component / modal |
+| `{:GUILD_CREATE, guild}` | Guild available |
+| `{:GUILD_MEMBER_ADD, member}` | Member joined |
+| `{:VOICE_STATE_UPDATE, state}` | Voice state changed |
+| `{:CHANNEL_CREATE, channel}` | Channel created |
+| `{:THREAD_CREATE, thread}` | Thread created |
+| `{:AUTO_MODERATION_ACTION_EXECUTION, action}` | AutoMod triggered |
+
+Plus 60+ more — see [HexDocs](https://hexdocs.pm/eda) for the full list.
+
+## Gateway
+
+```elixir
+config :eda,
+  intents: [:guilds, :guild_messages, :message_content],
+  # or :all, :nonprivileged
+  encoding: :etf,      # :json (default) or :etf for binary encoding
+  compress: true        # zlib transport compression
+```
+
+Sharding is automatic. EDA fetches the recommended shard count from Discord, launches shards with staggered timing, and tracks per-shard readiness. Override with:
+
+```elixir
+config :eda, :gateway,
+  shard_count: 4  # Fixed shard count
+```
 
 ## Architecture
 
 ```
-EDA.Supervisor
+EDA.Application
 ├── EDA.Cache.Supervisor
-│   ├── EDA.Cache.Guild (ETS)
-│   ├── EDA.Cache.User (ETS)
-│   └── EDA.Cache.Channel (ETS)
-├── EDA.REST.RateLimiter (GenServer)
-└── EDA.Gateway.Supervisor
-    └── EDA.Gateway.Connection (WebSockex)
+│   ├── EDA.Cache.Guild      (ETS)
+│   ├── EDA.Cache.Channel    (ETS)
+│   ├── EDA.Cache.User       (ETS)
+│   ├── EDA.Cache.Member     (ETS)
+│   ├── EDA.Cache.Role       (ETS)
+│   ├── EDA.Cache.Presence   (ETS)
+│   ├── EDA.Cache.VoiceState (ETS)
+│   └── EDA.Cache.Evictor
+├── EDA.HTTP.RateLimiter
+└── EDA.Gateway.ShardSupervisor
+    ├── EDA.Gateway.ShardManager
+    ├── EDA.Gateway.ReadyTracker
+    ├── EDA.Gateway.MemberChunker
+    └── EDA.Gateway.Connection (per shard)
 ```
 
-## Comparison with Nostrum
+## Documentation
 
-| Feature | EDA | Nostrum |
-|---------|-----|---------|
-| WebSocket Library | WebSockex | Gun |
-| HTTP Library | HTTPoison | Gun |
-| Event Handling | Simple callbacks | GenStage (optional) |
-| Caching | ETS (simple) | ETS/Mnesia (pluggable) |
-| Sharding | Basic | Full support |
-| Voice | Not yet | Supported |
-| Learning Curve | Easy | Moderate |
-
-EDA is designed to be simpler and more approachable, while Nostrum offers more advanced features for larger bots.
-
-## Roadmap
-
-- [ ] Slash commands support
-- [ ] Voice channel support
-- [ ] Multi-shard support
-- [ ] GenStage-based event handling
-- [ ] Pluggable cache backends
-- [ ] Rate limit header parsing
+Full documentation is available on [HexDocs](https://hexdocs.pm/eda).
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT — see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Contributions are welcome! Open an issue or submit a pull request.

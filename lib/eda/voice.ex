@@ -89,6 +89,26 @@ defmodule EDA.Voice do
   end
 
   @doc """
+  Enables continuous audio receiving for the given guild.
+
+  Incoming voice packets will be dispatched as `VOICE_AUDIO` events
+  via `EDA.Gateway.Events`, along with `VOICE_SPEAKING_START` and
+  `VOICE_SPEAKING_STOP` events when users begin or stop speaking.
+  """
+  @spec start_listening(String.t()) :: :ok | {:error, term()}
+  def start_listening(guild_id) do
+    GenServer.call(__MODULE__, {:start_listening, guild_id})
+  end
+
+  @doc """
+  Disables continuous audio receiving for the given guild.
+  """
+  @spec stop_listening(String.t()) :: :ok
+  def stop_listening(guild_id) do
+    GenServer.call(__MODULE__, {:stop_listening, guild_id})
+  end
+
+  @doc """
   Returns `true` if audio is currently playing in the given guild.
   """
   @spec playing?(String.t()) :: boolean()
@@ -110,6 +130,23 @@ defmodule EDA.Voice do
   @spec channel_id(String.t()) :: String.t() | nil
   def channel_id(guild_id) do
     GenServer.call(__MODULE__, {:channel_id, guild_id})
+  end
+
+  @doc """
+  Returns the voice state for the given guild if the connection is ready.
+  """
+  @spec get_voice_state(String.t()) :: {:ok, State.t()} | {:error, :not_ready | :not_connected}
+  def get_voice_state(guild_id) do
+    GenServer.call(__MODULE__, {:get_voice_state, guild_id})
+  end
+
+  @doc """
+  Sets the audio pid for a guild, preventing conflicts with `play/3`.
+  Use `nil` to clear it when done.
+  """
+  @spec set_audio_pid(String.t(), pid() | nil) :: :ok
+  def set_audio_pid(guild_id, pid) do
+    GenServer.cast(__MODULE__, {:set_audio_pid, guild_id, pid})
   end
 
   @doc """
@@ -150,19 +187,24 @@ defmodule EDA.Voice do
   end
 
   @doc false
-  def playback_finished(guild_id) do
-    GenServer.cast(__MODULE__, {:playback_finished, guild_id})
+  def playback_finished(guild_id, seq, ts, nonce) do
+    GenServer.cast(__MODULE__, {:playback_finished, guild_id, seq, ts, nonce})
   end
 
   # Server Callbacks
 
   @impl true
   def init(_) do
+    Process.flag(:trap_exit, true)
     {:ok, %{guilds: %{}}}
   end
 
   @impl true
   def handle_call({:join, guild_id, channel_id, opts}, _from, state) do
+    Logger.info(
+      "Voice.join called: guild=#{guild_id} channel=#{channel_id} opts=#{inspect(opts)}"
+    )
+
     voice_state = %State{
       guild_id: guild_id,
       channel_id: channel_id
@@ -171,6 +213,7 @@ defmodule EDA.Voice do
     new_guilds = Map.put(state.guilds, guild_id, voice_state)
 
     # Send OP 4 to the main gateway
+    Logger.debug("Sending OP 4 (Voice State Update) to gateway for guild #{guild_id}")
     EDA.Gateway.Connection.update_voice_state(guild_id, channel_id, opts)
 
     {:reply, :ok, %{state | guilds: new_guilds}}
@@ -265,6 +308,41 @@ defmodule EDA.Voice do
     {:reply, channel, state}
   end
 
+  def handle_call({:get_voice_state, guild_id}, _from, state) do
+    case Map.get(state.guilds, guild_id) do
+      %State{ready: true} = vs -> {:reply, {:ok, vs}, state}
+      %State{} -> {:reply, {:error, :not_ready}, state}
+      nil -> {:reply, {:error, :not_connected}, state}
+    end
+  end
+
+  def handle_call({:start_listening, guild_id}, _from, state) do
+    case Map.get(state.guilds, guild_id) do
+      %State{ready: true} = voice_state ->
+        Session.start_listening(guild_id)
+        new_vs = %{voice_state | listening: true}
+        {:reply, :ok, put_in(state, [:guilds, guild_id], new_vs)}
+
+      %State{} ->
+        {:reply, {:error, :not_ready}, state}
+
+      nil ->
+        {:reply, {:error, :not_connected}, state}
+    end
+  end
+
+  def handle_call({:stop_listening, guild_id}, _from, state) do
+    case Map.get(state.guilds, guild_id) do
+      %State{listening: true} = voice_state ->
+        Session.stop_listening(guild_id)
+        new_vs = %{voice_state | listening: false}
+        {:reply, :ok, put_in(state, [:guilds, guild_id], new_vs)}
+
+      _ ->
+        {:reply, :ok, state}
+    end
+  end
+
   def handle_call({:listen, guild_id, count}, _from, state) do
     case Map.get(state.guilds, guild_id) do
       %State{ready: true, udp_socket: socket, secret_key: key, encryption_mode: mode}
@@ -279,8 +357,11 @@ defmodule EDA.Voice do
 
   @impl true
   def handle_cast({:voice_state_update, guild_id, session_id}, state) do
+    Logger.debug("voice_state_update received: guild=#{guild_id} session_id=#{session_id}")
+
     case Map.get(state.guilds, guild_id) do
       nil ->
+        Logger.warning("voice_state_update: guild #{guild_id} not in voice state map, ignoring")
         {:noreply, state}
 
       voice_state ->
@@ -292,8 +373,13 @@ defmodule EDA.Voice do
   end
 
   def handle_cast({:voice_server_update, guild_id, token, endpoint}, state) do
+    Logger.debug(
+      "voice_server_update received: guild=#{guild_id} endpoint=#{endpoint} token=#{if token, do: String.slice(token, 0..7) <> "...", else: "nil"}"
+    )
+
     case Map.get(state.guilds, guild_id) do
       nil ->
+        Logger.warning("voice_server_update: guild #{guild_id} not in voice state map, ignoring")
         {:noreply, state}
 
       voice_state ->
@@ -332,6 +418,8 @@ defmodule EDA.Voice do
         {:noreply, state}
 
       voice_state ->
+        if voice_state.audio_pid, do: Process.exit(voice_state.audio_pid, :kill)
+
         # Clear ALL connection fields so maybe_start_session won't re-trigger
         new_vs = %{
           voice_state
@@ -341,7 +429,9 @@ defmodule EDA.Voice do
             session_id: nil,
             token: nil,
             endpoint: nil,
-            ssrc: nil
+            ssrc: nil,
+            audio_pid: nil,
+            listening: false
         }
 
         {:noreply, put_in(state, [:guilds, guild_id], new_vs)}
@@ -390,19 +480,29 @@ defmodule EDA.Voice do
     end
   end
 
-  def handle_cast({:playback_finished, guild_id}, state) do
+  def handle_cast({:playback_finished, guild_id, seq, ts, nonce}, state) do
     case Map.get(state.guilds, guild_id) do
       nil ->
         {:noreply, state}
 
       voice_state ->
-        new_vs = %{voice_state | audio_pid: nil}
+        new_vs = %{voice_state | audio_pid: nil, sequence: seq, timestamp: ts, nonce: nonce}
 
         EDA.Gateway.Events.dispatch("VOICE_PLAYBACK_FINISHED", %{
           "guild_id" => guild_id
         })
 
         {:noreply, put_in(state, [:guilds, guild_id], new_vs)}
+    end
+  end
+
+  def handle_cast({:set_audio_pid, guild_id, pid}, state) do
+    case Map.get(state.guilds, guild_id) do
+      %State{} = vs ->
+        {:noreply, put_in(state, [:guilds, guild_id], %{vs | audio_pid: pid})}
+
+      nil ->
+        {:noreply, state}
     end
   end
 
@@ -458,8 +558,25 @@ defmodule EDA.Voice do
           endpoint: ep
         ]
 
-        DynamicSupervisor.start_child(EDA.Voice.DynamicSupervisor, {Session, opts})
+        case DynamicSupervisor.start_child(EDA.Voice.DynamicSupervisor, {Session, opts}) do
+          {:ok, pid} ->
+            Logger.info("Voice session started for guild #{guild_id}: #{inspect(pid)}")
+
+          {:error, reason} ->
+            Logger.error(
+              "Failed to start voice session for guild #{guild_id}: #{inspect(reason)}"
+            )
+        end
     end
+  end
+
+  defp maybe_start_session(guild_id, %State{} = vs) do
+    Logger.debug(
+      "maybe_start_session: not ready for guild #{guild_id} — " <>
+        "session_id=#{inspect(vs.session_id != nil)} " <>
+        "token=#{inspect(vs.token != nil)} " <>
+        "endpoint=#{inspect(vs.endpoint != nil)}"
+    )
   end
 
   defp maybe_start_session(_guild_id, _state), do: :ok

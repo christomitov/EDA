@@ -2,14 +2,16 @@ defmodule EDA.Cache.Role do
   @moduledoc """
   ETS-based cache for Discord roles.
 
-  Keyed by `role_id`. Each role includes its `guild_id` for filtering.
-
-  Automatically populated from GUILD_CREATE and GUILD_ROLE_CREATE/UPDATE/DELETE events.
+  Uses composite keys `{guild_id, role_id}` for O(guild_size) lookups
+  via `for_guild/1` instead of full table scans. A reverse index table
+  maps `role_id` to `guild_id` for efficient single-role lookups.
   """
 
   use GenServer
 
   @table :eda_roles
+  @index :eda_roles_index
+  @cache_name :roles
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
@@ -20,21 +22,35 @@ defmodule EDA.Cache.Role do
   """
   @spec get(String.t() | integer()) :: map() | nil
   def get(role_id) do
-    case :ets.lookup(@table, to_string(role_id)) do
-      [{_, role}] -> role
-      [] -> nil
+    role_id = to_string(role_id)
+
+    case :ets.lookup(@index, role_id) do
+      [{_, guild_id}] ->
+        case :ets.lookup(@table, {guild_id, role_id}) do
+          [{_, role}] ->
+            :telemetry.execute([:eda, :cache, :hit], %{count: 1}, %{cache: @cache_name})
+            role
+
+          [] ->
+            :telemetry.execute([:eda, :cache, :miss], %{count: 1}, %{cache: @cache_name})
+            nil
+        end
+
+      [] ->
+        :telemetry.execute([:eda, :cache, :miss], %{count: 1}, %{cache: @cache_name})
+        nil
     end
   end
 
   @doc """
-  Gets all roles for a guild.
+  Gets all roles for a guild. O(guild_size) via match_object.
   """
   @spec for_guild(String.t() | integer()) :: [map()]
   def for_guild(guild_id) do
     guild_id = to_string(guild_id)
 
-    all()
-    |> Enum.filter(fn role -> role["guild_id"] == guild_id end)
+    :ets.match_object(@table, {{guild_id, :_}, :_})
+    |> Enum.map(fn {_, role} -> role end)
   end
 
   @doc """
@@ -51,10 +67,28 @@ defmodule EDA.Cache.Role do
   """
   @spec create(String.t(), map()) :: map()
   def create(guild_id, role) do
+    guild_id = to_string(guild_id)
     role_id = to_string(role["id"])
-    role_with_guild = Map.put(role, "guild_id", to_string(guild_id))
-    :ets.insert(@table, {role_id, role_with_guild})
-    role_with_guild
+    key = {guild_id, role_id}
+    role_with_guild = Map.put(role, "guild_id", guild_id)
+
+    case EDA.Cache.Policy.check(
+           EDA.Cache.Config.policy(@cache_name),
+           :role,
+           key,
+           role_with_guild
+         ) do
+      :cache ->
+        :ets.insert(@table, {key, role_with_guild})
+        :ets.insert(@index, {role_id, guild_id})
+        EDA.Cache.Evictor.touch(@table, key)
+        :telemetry.execute([:eda, :cache, :write], %{count: 1}, %{cache: @cache_name})
+        role_with_guild
+
+      :skip ->
+        :telemetry.execute([:eda, :cache, :skip], %{count: 1}, %{cache: @cache_name})
+        role_with_guild
+    end
   end
 
   @doc """
@@ -70,7 +104,8 @@ defmodule EDA.Cache.Role do
 
       existing ->
         updated = Map.merge(existing, updates)
-        :ets.insert(@table, {role_id, updated})
+        guild_id = updated["guild_id"]
+        :ets.insert(@table, {{guild_id, role_id}, updated})
         updated
     end
   end
@@ -80,7 +115,19 @@ defmodule EDA.Cache.Role do
   """
   @spec delete(String.t() | integer()) :: :ok
   def delete(role_id) do
-    :ets.delete(@table, to_string(role_id))
+    role_id = to_string(role_id)
+
+    case :ets.lookup(@index, role_id) do
+      [{_, guild_id}] ->
+        key = {guild_id, role_id}
+        :ets.delete(@table, key)
+        :ets.delete(@index, role_id)
+        EDA.Cache.Evictor.remove(@table, key)
+
+      [] ->
+        :ok
+    end
+
     :ok
   end
 
@@ -91,9 +138,13 @@ defmodule EDA.Cache.Role do
   def delete_guild(guild_id) do
     guild_id = to_string(guild_id)
 
-    for_guild(guild_id)
-    |> Enum.each(fn role -> :ets.delete(@table, role["id"]) end)
+    roles = :ets.match(@table, {{guild_id, :"$1"}, :_})
 
+    for [role_id] <- roles do
+      :ets.delete(@index, role_id)
+    end
+
+    :ets.match_delete(@table, {{guild_id, :_}, :_})
     :ok
   end
 
@@ -107,7 +158,8 @@ defmodule EDA.Cache.Role do
 
   @impl true
   def init(_opts) do
-    table = :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
-    {:ok, %{table: table}}
+    :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+    :ets.new(@index, [:set, :public, :named_table, read_concurrency: true])
+    {:ok, %{}}
   end
 end

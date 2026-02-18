@@ -6,7 +6,7 @@ defmodule EDA.Voice.Audio do
 
   require Logger
 
-  alias EDA.Voice.{Crypto, Ogg, Payload, Session}
+  alias EDA.Voice.{Crypto, Dave, Ogg, Payload, Session}
 
   @ip_discovery_type 0x01
   @ip_discovery_length 70
@@ -90,30 +90,31 @@ defmodule EDA.Voice.Audio do
     # Must send speaking before any audio data
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, true))
 
-    stream_from_port(port, guild_id, voice_state)
+    final = stream_from_port(port, guild_id, voice_state)
 
-    send_silence(guild_id, voice_state)
+    send_silence(guild_id, voice_state, final.seq, final.ts, final.nonce)
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, false))
 
-    EDA.Voice.playback_finished(guild_id)
+    EDA.Voice.playback_finished(guild_id, final.seq, final.ts, final.nonce)
   end
 
   defp player_loop(guild_id, frames, :raw, voice_state) do
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, true))
 
-    send_frames(
-      frames,
-      guild_id,
-      voice_state,
-      voice_state.sequence,
-      voice_state.timestamp,
-      voice_state.nonce
-    )
+    {final_seq, final_ts, final_nonce, _} =
+      send_frames(
+        frames,
+        guild_id,
+        voice_state,
+        voice_state.sequence,
+        voice_state.timestamp,
+        voice_state.nonce
+      )
 
-    send_silence(guild_id, voice_state)
+    send_silence(guild_id, voice_state, final_seq, final_ts, final_nonce)
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, false))
 
-    EDA.Voice.playback_finished(guild_id)
+    EDA.Voice.playback_finished(guild_id, final_seq, final_ts, final_nonce)
   end
 
   # FFmpeg outputs OGG pages via `-f ogg`. We parse those pages to get individual
@@ -145,16 +146,16 @@ defmodule EDA.Voice.Audio do
 
       {^port, {:exit_status, 0}} ->
         Logger.debug("FFmpeg finished successfully")
-        :ok
+        s
 
       {^port, {:exit_status, status}} ->
         Logger.warning("FFmpeg exited with status #{status}")
-        :ok
+        s
     after
       10_000 ->
         Port.close(port)
         Logger.warning("FFmpeg timed out")
-        :ok
+        s
     end
   end
 
@@ -245,6 +246,9 @@ defmodule EDA.Voice.Audio do
   end
 
   defp send_single_frame(frame, voice_state, seq, timestamp, nonce) do
+    # DAVE E2EE encrypt if active (before transport encryption)
+    frame = maybe_dave_encrypt(frame, voice_state.dave_manager)
+
     packet =
       Crypto.encrypt_packet(
         frame,
@@ -264,7 +268,15 @@ defmodule EDA.Voice.Audio do
     )
   end
 
-  defp send_silence(guild_id, voice_state) do
+  defp maybe_dave_encrypt(frame, %Dave.Manager{} = mgr) do
+    case Dave.Manager.encrypt_frame(mgr, frame) do
+      {encrypted, _updated_mgr} -> encrypted
+    end
+  end
+
+  defp maybe_dave_encrypt(frame, _manager), do: frame
+
+  defp send_silence(guild_id, voice_state, seq, ts, nonce) do
     silence = <<0xF8, 0xFF, 0xFE>>
     frames = List.duplicate(silence, @silence_frames)
 
@@ -272,9 +284,9 @@ defmodule EDA.Voice.Audio do
       frames,
       guild_id,
       voice_state,
-      voice_state.sequence,
-      voice_state.timestamp,
-      voice_state.nonce
+      seq,
+      ts,
+      nonce
     )
   end
 

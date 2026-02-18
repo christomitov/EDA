@@ -1,0 +1,197 @@
+defmodule EDA.AutoMod do
+  @moduledoc """
+  Represents a Discord Auto Moderation rule.
+
+  Auto Moderation allows guilds to automatically filter messages and member
+  profiles based on keywords, spam detection, mention limits, and Discord's
+  preset word lists.
+
+  ## Trigger Types
+
+  | Value | Name | Max per Guild | Description |
+  |-------|------|---------------|-------------|
+  | 1 | `keyword` | 6 | Custom keyword filter |
+  | 3 | `spam` | 1 | Discord's spam detection |
+  | 4 | `keyword_preset` | 1 | Discord's preset word lists |
+  | 5 | `mention_spam` | 1 | Unique mention threshold |
+  | 6 | `member_profile` | 1 | Profile keyword filter |
+
+  ## Constants
+
+  All Discord limits are exposed as functions:
+
+      EDA.AutoMod.trigger_keyword()        # => 1
+      EDA.AutoMod.max_keyword_amount()     # => 1000
+      EDA.AutoMod.max_exempt_roles()       # => 20
+  """
+
+  alias EDA.AutoMod.{Action, TriggerMetadata}
+
+  defstruct [
+    :id,
+    :guild_id,
+    :name,
+    :creator_id,
+    :event_type,
+    :trigger_type,
+    :trigger_metadata,
+    :actions,
+    :enabled,
+    :exempt_roles,
+    :exempt_channels
+  ]
+
+  @type t :: %__MODULE__{
+          id: String.t() | nil,
+          guild_id: String.t() | nil,
+          name: String.t() | nil,
+          creator_id: String.t() | nil,
+          event_type: integer() | nil,
+          trigger_type: integer() | nil,
+          trigger_metadata: TriggerMetadata.t() | nil,
+          actions: [Action.t()] | nil,
+          enabled: boolean() | nil,
+          exempt_roles: [String.t()] | nil,
+          exempt_channels: [String.t()] | nil
+        }
+
+  # ── Event Types ──
+
+  @doc "Message send event type (1)."
+  @spec event_message_send() :: 1
+  def event_message_send, do: 1
+
+  @doc "Member update event type (2)."
+  @spec event_member_update() :: 2
+  def event_member_update, do: 2
+
+  # ── Trigger Types ──
+
+  @doc "Custom keyword filter trigger (1). Max 6 per guild."
+  @spec trigger_keyword() :: 1
+  def trigger_keyword, do: 1
+
+  @doc "Discord spam detection trigger (3). Max 1 per guild."
+  @spec trigger_spam() :: 3
+  def trigger_spam, do: 3
+
+  @doc "Discord preset word lists trigger (4). Max 1 per guild."
+  @spec trigger_keyword_preset() :: 4
+  def trigger_keyword_preset, do: 4
+
+  @doc "Unique mention threshold trigger (5). Max 1 per guild."
+  @spec trigger_mention_spam() :: 5
+  def trigger_mention_spam, do: 5
+
+  @doc "Profile keyword filter trigger (6). Max 1 per guild."
+  @spec trigger_member_profile() :: 6
+  def trigger_member_profile, do: 6
+
+  # ── Action Types ──
+
+  @doc "Block message action type (1)."
+  @spec action_block_message() :: 1
+  def action_block_message, do: 1
+
+  @doc "Send alert action type (2)."
+  @spec action_send_alert() :: 2
+  def action_send_alert, do: 2
+
+  @doc "Timeout action type (3)."
+  @spec action_timeout() :: 3
+  def action_timeout, do: 3
+
+  @doc "Block member interaction action type (4)."
+  @spec action_block_member_interaction() :: 4
+  def action_block_member_interaction, do: 4
+
+  # ── Keyword Presets ──
+
+  @doc "Profanity preset (1)."
+  @spec preset_profanity() :: 1
+  def preset_profanity, do: 1
+
+  @doc "Sexual content preset (2)."
+  @spec preset_sexual_content() :: 2
+  def preset_sexual_content, do: 2
+
+  @doc "Slurs preset (3)."
+  @spec preset_slurs() :: 3
+  def preset_slurs, do: 3
+
+  # ── Limits ──
+
+  @doc "Maximum number of keyword filter entries (1000)."
+  @spec max_keyword_amount() :: 1000
+  def max_keyword_amount, do: 1000
+
+  @doc "Maximum keyword length in characters (60)."
+  @spec max_keyword_length() :: 60
+  def max_keyword_length, do: 60
+
+  @doc "Maximum number of regex patterns (10)."
+  @spec max_regex_patterns() :: 10
+  def max_regex_patterns, do: 10
+
+  @doc "Maximum regex pattern length in characters (260)."
+  @spec max_regex_length() :: 260
+  def max_regex_length, do: 260
+
+  @doc "Maximum allow list entries for keyword trigger (100)."
+  @spec max_allow_list_keyword() :: 100
+  def max_allow_list_keyword, do: 100
+
+  @doc "Maximum allow list entries for preset trigger (1000)."
+  @spec max_allow_list_preset() :: 1000
+  def max_allow_list_preset, do: 1000
+
+  @doc "Maximum mention limit (50)."
+  @spec max_mention_limit() :: 50
+  def max_mention_limit, do: 50
+
+  @doc "Maximum exempt roles per rule (20)."
+  @spec max_exempt_roles() :: 20
+  def max_exempt_roles, do: 20
+
+  @doc "Maximum exempt channels per rule (50)."
+  @spec max_exempt_channels() :: 50
+  def max_exempt_channels, do: 50
+
+  @doc "Maximum custom message length in characters (150)."
+  @spec max_custom_message_length() :: 150
+  def max_custom_message_length, do: 150
+
+  @doc "Maximum timeout duration in seconds — 4 weeks (2,419,200)."
+  @spec max_timeout_seconds() :: 2_419_200
+  def max_timeout_seconds, do: 2_419_200
+
+  @doc "Maximum rule name length in characters (100)."
+  @spec max_name_length() :: 100
+  def max_name_length, do: 100
+
+  # ── Parsing ──
+
+  @doc "Converts a raw Discord Auto Moderation rule map into this struct."
+  @spec from_raw(map()) :: t()
+  def from_raw(raw) when is_map(raw) do
+    actions =
+      case raw["actions"] do
+        list when is_list(list) -> Enum.map(list, &Action.from_raw/1)
+        _ -> nil
+      end
+
+    %__MODULE__{
+      id: raw["id"],
+      guild_id: raw["guild_id"],
+      name: raw["name"],
+      creator_id: raw["creator_id"],
+      event_type: raw["event_type"],
+      trigger_type: raw["trigger_type"],
+      trigger_metadata: TriggerMetadata.from_raw(raw["trigger_metadata"]),
+      actions: actions,
+      enabled: raw["enabled"],
+      exempt_roles: raw["exempt_roles"],
+      exempt_channels: raw["exempt_channels"]
+    }
+  end
+end

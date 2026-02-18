@@ -28,18 +28,31 @@ defmodule EDA.Application do
       """)
     end
 
+    # Event dispatch concurrency counter
+    counter = :counters.new(1, [:write_concurrency])
+    :persistent_term.put(:eda_event_task_counter, counter)
+
     children = [
       # Cache supervisor - starts ETS tables
       EDA.Cache.Supervisor,
 
       # Rate limiter for REST API
-      EDA.REST.RateLimiter,
+      EDA.HTTP.RateLimiter,
 
       # Voice supervisor - manages voice connections
       EDA.Voice.Supervisor,
 
-      # Gateway supervisor - manages WebSocket connection
-      {EDA.Gateway.Supervisor, token: token}
+      # Task supervisor for event dispatch
+      {Task.Supervisor, name: EDA.Gateway.TaskSupervisor},
+
+      # Member chunker for OP 8 (Request Guild Members)
+      EDA.Gateway.MemberChunker,
+
+      # Ready tracker — fires SHARD_READY / ALL_SHARDS_READY after startup
+      EDA.Gateway.ReadyTracker,
+
+      # Gateway shard supervisor - manages sharded WebSocket connections
+      {EDA.Gateway.ShardSupervisor, token: token}
     ]
 
     opts = [strategy: :one_for_one, name: EDA.Supervisor]

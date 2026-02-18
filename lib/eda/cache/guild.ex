@@ -8,6 +8,7 @@ defmodule EDA.Cache.Guild do
   use GenServer
 
   @table :eda_guilds
+  @cache_name :guilds
 
   # Client API
 
@@ -21,8 +22,13 @@ defmodule EDA.Cache.Guild do
   @spec get(String.t() | integer()) :: map() | nil
   def get(guild_id) do
     case :ets.lookup(@table, to_string(guild_id)) do
-      [{_, guild}] -> guild
-      [] -> nil
+      [{_, guild}] ->
+        :telemetry.execute([:eda, :cache, :hit], %{count: 1}, %{cache: @cache_name})
+        guild
+
+      [] ->
+        :telemetry.execute([:eda, :cache, :miss], %{count: 1}, %{cache: @cache_name})
+        nil
     end
   end
 
@@ -41,8 +47,18 @@ defmodule EDA.Cache.Guild do
   @spec create(map()) :: map()
   def create(guild) do
     guild_id = to_string(guild["id"])
-    :ets.insert(@table, {guild_id, guild})
-    guild
+
+    case EDA.Cache.Policy.check(EDA.Cache.Config.policy(@cache_name), :guild, guild_id, guild) do
+      :cache ->
+        :ets.insert(@table, {guild_id, guild})
+        EDA.Cache.Evictor.touch(@table, guild_id)
+        :telemetry.execute([:eda, :cache, :write], %{count: 1}, %{cache: @cache_name})
+        guild
+
+      :skip ->
+        :telemetry.execute([:eda, :cache, :skip], %{count: 1}, %{cache: @cache_name})
+        guild
+    end
   end
 
   @doc """
@@ -68,7 +84,9 @@ defmodule EDA.Cache.Guild do
   """
   @spec delete(String.t() | integer()) :: :ok
   def delete(guild_id) do
-    :ets.delete(@table, to_string(guild_id))
+    key = to_string(guild_id)
+    :ets.delete(@table, key)
+    EDA.Cache.Evictor.remove(@table, key)
     :ok
   end
 

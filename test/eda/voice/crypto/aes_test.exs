@@ -38,7 +38,7 @@ defmodule EDA.Voice.Crypto.AESTest do
       frame = :crypto.strong_rand_bytes(12 + 160)
       encrypted = AES.encrypt(frame, @secret_key, 0)
 
-      assert {:ok, decrypted} = AES.decrypt(encrypted, @secret_key)
+      assert {:ok, decrypted} = AES.decrypt(encrypted, @secret_key, 12)
       # decrypted is the payload without the RTP header
       <<_rtp::binary-size(12), payload::binary>> = frame
       assert decrypted == payload
@@ -48,7 +48,7 @@ defmodule EDA.Voice.Crypto.AESTest do
       for nonce <- [0, 1, 255, 65_535, 16_777_215] do
         frame = :crypto.strong_rand_bytes(12 + 80)
         encrypted = AES.encrypt(frame, @secret_key, nonce)
-        assert {:ok, _} = AES.decrypt(encrypted, @secret_key)
+        assert {:ok, _} = AES.decrypt(encrypted, @secret_key, 12)
       end
     end
 
@@ -57,7 +57,7 @@ defmodule EDA.Voice.Crypto.AESTest do
       encrypted = AES.encrypt(frame, @secret_key, 0)
 
       wrong_key = :crypto.strong_rand_bytes(32)
-      assert :error = AES.decrypt(encrypted, wrong_key)
+      assert :error = AES.decrypt(encrypted, wrong_key, 12)
     end
 
     test "fails with tampered ciphertext" do
@@ -68,7 +68,7 @@ defmodule EDA.Voice.Crypto.AESTest do
       <<header::binary-size(12), byte, rest::binary>> = encrypted
       tampered = header <> <<Bitwise.bxor(byte, 0xFF)>> <> rest
 
-      assert :error = AES.decrypt(tampered, @secret_key)
+      assert :error = AES.decrypt(tampered, @secret_key, 12)
     end
   end
 

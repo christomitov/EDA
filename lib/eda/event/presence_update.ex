@@ -1,0 +1,32 @@
+defmodule EDA.Event.PresenceUpdate do
+  @moduledoc "Dispatched when a user's presence is updated."
+  use EDA.Event.Access
+
+  defstruct [:guild_id, :user, :status, :activities, :client_status]
+
+  @type t :: %__MODULE__{
+          guild_id: String.t() | nil,
+          user: EDA.User.t() | nil,
+          status: String.t() | nil,
+          activities: [EDA.Activity.t()] | nil,
+          client_status: map() | nil
+        }
+
+  @doc "Converts a raw Discord payload into this event struct."
+  @spec from_raw(map()) :: t()
+  def from_raw(raw) when is_map(raw) do
+    %__MODULE__{
+      guild_id: raw["guild_id"],
+      user: parse_user(raw["user"]),
+      status: raw["status"],
+      activities: parse_activities(raw["activities"]),
+      client_status: raw["client_status"]
+    }
+  end
+
+  defp parse_user(nil), do: nil
+  defp parse_user(raw) when is_map(raw), do: EDA.User.from_raw(raw)
+
+  defp parse_activities(nil), do: nil
+  defp parse_activities(list) when is_list(list), do: Enum.map(list, &EDA.Activity.from_raw/1)
+end

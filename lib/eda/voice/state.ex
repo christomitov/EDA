@@ -22,8 +22,10 @@ defmodule EDA.Voice.State do
     speaking: false,
     paused: false,
     ready: false,
+    listening: false,
     nonce: 0,
-    restart_count: 0
+    restart_count: 0,
+    dave_manager: nil
   ]
 
   @type t :: %__MODULE__{
@@ -45,6 +47,7 @@ defmodule EDA.Voice.State do
           speaking: boolean(),
           paused: boolean(),
           ready: boolean(),
+          listening: boolean(),
           nonce: integer(),
           restart_count: integer()
         }

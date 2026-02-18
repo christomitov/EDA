@@ -1,0 +1,500 @@
+defmodule EDA.PermissionTest do
+  use ExUnit.Case
+
+  # NOT async — shares ETS cache tables.
+
+  alias EDA.Permission
+
+  import Bitwise
+
+  # ── Test Data Helpers ─────────────────────────────────────────────
+
+  @guild_id "900"
+  @owner_id "1"
+  @admin_id "2"
+  @user_id "3"
+  @channel_id "100"
+  @voice_channel_id "200"
+  @role_a_id "10"
+  @role_b_id "20"
+
+  defp setup_guild(_context) do
+    # Clean up any previous test data
+    EDA.Cache.Guild.create(%{
+      "id" => @guild_id,
+      "name" => "Test Guild",
+      "owner_id" => @owner_id
+    })
+
+    # @everyone role (same ID as guild)
+    EDA.Cache.Role.create(@guild_id, %{
+      "id" => @guild_id,
+      "permissions" => to_string(Permission.to_bitset([:view_channel, :send_messages]))
+    })
+
+    # Role A — moderate permissions
+    EDA.Cache.Role.create(@guild_id, %{
+      "id" => @role_a_id,
+      "permissions" => to_string(Permission.to_bitset([:manage_messages, :embed_links]))
+    })
+
+    # Role B — admin
+    EDA.Cache.Role.create(@guild_id, %{
+      "id" => @role_b_id,
+      "permissions" => to_string(Permission.to_bitset([:administrator]))
+    })
+
+    # Owner member
+    EDA.Cache.Member.create(@guild_id, %{
+      "user" => %{"id" => @owner_id},
+      "roles" => []
+    })
+
+    # Admin member (has role B)
+    EDA.Cache.Member.create(@guild_id, %{
+      "user" => %{"id" => @admin_id},
+      "roles" => [@role_b_id]
+    })
+
+    # Regular member (has role A)
+    EDA.Cache.Member.create(@guild_id, %{
+      "user" => %{"id" => @user_id},
+      "roles" => [@role_a_id]
+    })
+
+    # Text channel — no overwrites
+    EDA.Cache.Channel.create(%{
+      "id" => @channel_id,
+      "guild_id" => @guild_id,
+      "type" => 0,
+      "permission_overwrites" => []
+    })
+
+    # Voice channel — no overwrites
+    EDA.Cache.Channel.create(%{
+      "id" => @voice_channel_id,
+      "guild_id" => @guild_id,
+      "type" => 2,
+      "permission_overwrites" => []
+    })
+
+    :ok
+  end
+
+  # ── Conversion Tests ──────────────────────────────────────────────
+
+  describe "to_bit/1" do
+    test "returns correct bit values" do
+      assert Permission.to_bit(:administrator) == 1 <<< 3
+      assert Permission.to_bit(:view_channel) == 1 <<< 10
+      assert Permission.to_bit(:send_messages) == 1 <<< 11
+      assert Permission.to_bit(:manage_roles) == 1 <<< 28
+    end
+  end
+
+  describe "from_bit/1" do
+    test "returns flag for known bit" do
+      assert {:ok, :administrator} = Permission.from_bit(1 <<< 3)
+    end
+
+    test "returns error for unknown bit" do
+      assert :error = Permission.from_bit(1 <<< 47)
+    end
+  end
+
+  describe "to_bitset/1 and to_list/1" do
+    test "round-trips" do
+      flags = [:view_channel, :send_messages, :administrator]
+      bitset = Permission.to_bitset(flags)
+      result = Permission.to_list(bitset)
+      assert Enum.sort(result) == Enum.sort(flags)
+    end
+
+    test "empty list" do
+      assert Permission.to_bitset([]) == 0
+      assert Permission.to_list(0) == []
+    end
+  end
+
+  describe "has?/2" do
+    test "true when flag is set" do
+      bitset = Permission.to_bitset([:view_channel, :send_messages])
+      assert Permission.has?(bitset, :view_channel)
+      assert Permission.has?(bitset, :send_messages)
+    end
+
+    test "false when flag is not set" do
+      bitset = Permission.to_bitset([:view_channel])
+      refute Permission.has?(bitset, :administrator)
+    end
+  end
+
+  # ── Guild-Level Permissions ───────────────────────────────────────
+
+  describe "in_guild/2" do
+    setup :setup_guild
+
+    test "owner gets ALL permissions" do
+      assert {:ok, perms} = Permission.in_guild(@guild_id, @owner_id)
+      assert perms == Permission.all()
+    end
+
+    test "admin role grants ALL permissions" do
+      assert {:ok, perms} = Permission.in_guild(@guild_id, @admin_id)
+      assert perms == Permission.all()
+    end
+
+    test "regular member gets @everyone + role permissions" do
+      assert {:ok, perms} = Permission.in_guild(@guild_id, @user_id)
+      assert Permission.has?(perms, :view_channel)
+      assert Permission.has?(perms, :send_messages)
+      assert Permission.has?(perms, :manage_messages)
+      assert Permission.has?(perms, :embed_links)
+      refute Permission.has?(perms, :administrator)
+      refute Permission.has?(perms, :ban_members)
+    end
+
+    test "returns error for missing guild" do
+      assert {:error, :guild_not_found} = Permission.in_guild("nonexistent", @user_id)
+    end
+
+    test "returns error for missing member" do
+      assert {:error, :member_not_found} = Permission.in_guild(@guild_id, "nonexistent")
+    end
+  end
+
+  # ── Channel-Level Permissions ─────────────────────────────────────
+
+  describe "in_channel/3 — no overwrites" do
+    setup :setup_guild
+
+    test "owner gets ALL permissions in any channel" do
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @owner_id, @channel_id)
+      assert perms == Permission.all()
+    end
+
+    test "admin gets ALL permissions in any channel" do
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @admin_id, @channel_id)
+      assert perms == Permission.all()
+    end
+
+    test "regular member inherits guild perms in channel" do
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+      assert Permission.has?(perms, :view_channel)
+      assert Permission.has?(perms, :send_messages)
+      assert Permission.has?(perms, :manage_messages)
+    end
+
+    test "returns error for missing channel" do
+      assert {:error, :channel_not_found} = Permission.in_channel(@guild_id, @user_id, "nope")
+    end
+  end
+
+  describe "in_channel/3 — @everyone overwrite (tier 1)" do
+    setup :setup_guild
+
+    test "denies @everyone send_messages" do
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:send_messages))
+          }
+        ]
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+      refute Permission.has?(perms, :send_messages)
+      assert Permission.has?(perms, :view_channel)
+    end
+  end
+
+  describe "in_channel/3 — role overwrite (tier 2) overrides @everyone" do
+    setup :setup_guild
+
+    test "role allow overrides @everyone deny" do
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          # @everyone: deny send_messages
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:send_messages))
+          },
+          # Role A: allow send_messages
+          %{
+            "id" => @role_a_id,
+            "type" => 0,
+            "allow" => to_string(Permission.to_bit(:send_messages)),
+            "deny" => "0"
+          }
+        ]
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+      assert Permission.has?(perms, :send_messages)
+    end
+  end
+
+  describe "in_channel/3 — member overwrite (tier 3) overrides roles" do
+    setup :setup_guild
+
+    test "member deny overrides role allow" do
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          # Role A: allow send_messages
+          %{
+            "id" => @role_a_id,
+            "type" => 0,
+            "allow" => to_string(Permission.to_bit(:send_messages)),
+            "deny" => "0"
+          },
+          # Member: deny send_messages
+          %{
+            "id" => @user_id,
+            "type" => 1,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:send_messages))
+          }
+        ]
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+      refute Permission.has?(perms, :send_messages)
+    end
+
+    test "member allow overrides role deny" do
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          # Role A: deny embed_links
+          %{
+            "id" => @role_a_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:embed_links))
+          },
+          # Member: allow embed_links
+          %{
+            "id" => @user_id,
+            "type" => 1,
+            "allow" => to_string(Permission.to_bit(:embed_links)),
+            "deny" => "0"
+          }
+        ]
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+      assert Permission.has?(perms, :embed_links)
+    end
+  end
+
+  describe "in_channel/3 — full 3-tier cascade" do
+    setup :setup_guild
+
+    test "@everyone deny → role allow → member deny" do
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          # @everyone: deny send_messages + embed_links
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" =>
+              to_string(Permission.to_bit(:send_messages) ||| Permission.to_bit(:embed_links))
+          },
+          # Role A: allow send_messages
+          %{
+            "id" => @role_a_id,
+            "type" => 0,
+            "allow" => to_string(Permission.to_bit(:send_messages)),
+            "deny" => "0"
+          },
+          # Member: deny send_messages again
+          %{
+            "id" => @user_id,
+            "type" => 1,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:send_messages))
+          }
+        ]
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+      # send_messages: @everyone denied → role allowed → member denied → DENIED
+      refute Permission.has?(perms, :send_messages)
+      # embed_links: @everyone denied → no role override → no member override → DENIED
+      refute Permission.has?(perms, :embed_links)
+      # view_channel: not touched by any overwrite → still from guild base
+      assert Permission.has?(perms, :view_channel)
+    end
+  end
+
+  # ── Access Gates ──────────────────────────────────────────────────
+
+  describe "VIEW_CHANNEL access gate" do
+    setup :setup_guild
+
+    test "returns 0 when VIEW_CHANNEL is denied" do
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:view_channel))
+          }
+        ]
+      })
+
+      assert {:ok, 0} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+    end
+
+    test "admin bypasses VIEW_CHANNEL gate" do
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:view_channel))
+          }
+        ]
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @admin_id, @channel_id)
+      assert perms == Permission.all()
+    end
+  end
+
+  describe "VOICE_CONNECT access gate" do
+    setup :setup_guild
+
+    test "returns 0 in voice channel when CONNECT is denied" do
+      EDA.Cache.Channel.update(@voice_channel_id, %{
+        "permission_overwrites" => [
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:connect))
+          }
+        ]
+      })
+
+      assert {:ok, 0} = Permission.in_channel(@guild_id, @user_id, @voice_channel_id)
+    end
+
+    test "CONNECT gate does not apply to text channels" do
+      # Text channel without connect — should still work fine
+      EDA.Cache.Channel.update(@channel_id, %{
+        "permission_overwrites" => [
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:connect))
+          }
+        ]
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, @channel_id)
+      assert perms != 0
+      assert Permission.has?(perms, :view_channel)
+    end
+  end
+
+  # ── Convenience Functions ─────────────────────────────────────────
+
+  describe "has_permission?/4" do
+    setup :setup_guild
+
+    test "returns true when permission is granted" do
+      assert Permission.has_permission?(@guild_id, @user_id, @channel_id, :send_messages)
+    end
+
+    test "returns false when permission is denied" do
+      refute Permission.has_permission?(@guild_id, @user_id, @channel_id, :administrator)
+    end
+
+    test "returns false for missing data" do
+      refute Permission.has_permission?("nope", @user_id, @channel_id, :send_messages)
+    end
+  end
+
+  describe "has_guild_permission?/3" do
+    setup :setup_guild
+
+    test "returns true for owner" do
+      assert Permission.has_guild_permission?(@guild_id, @owner_id, :ban_members)
+    end
+
+    test "returns false when not granted" do
+      refute Permission.has_guild_permission?(@guild_id, @user_id, :ban_members)
+    end
+  end
+
+  # ── Edge Cases ────────────────────────────────────────────────────
+
+  describe "edge cases" do
+    setup :setup_guild
+
+    test "member with no roles gets only @everyone permissions" do
+      EDA.Cache.Member.create(@guild_id, %{
+        "user" => %{"id" => "99"},
+        "roles" => []
+      })
+
+      assert {:ok, perms} = Permission.in_guild(@guild_id, "99")
+      assert Permission.has?(perms, :view_channel)
+      assert Permission.has?(perms, :send_messages)
+      refute Permission.has?(perms, :manage_messages)
+    end
+
+    test "permissions field as integer (not string) works" do
+      EDA.Cache.Role.create(@guild_id, %{
+        "id" => "30",
+        "permissions" => Permission.to_bitset([:kick_members])
+      })
+
+      EDA.Cache.Member.create(@guild_id, %{
+        "user" => %{"id" => "98"},
+        "roles" => ["30"]
+      })
+
+      assert {:ok, perms} = Permission.in_guild(@guild_id, "98")
+      assert Permission.has?(perms, :kick_members)
+    end
+
+    test "channel with no permission_overwrites key works" do
+      EDA.Cache.Channel.create(%{
+        "id" => "300",
+        "guild_id" => @guild_id,
+        "type" => 0
+      })
+
+      assert {:ok, perms} = Permission.in_channel(@guild_id, @user_id, "300")
+      assert Permission.has?(perms, :view_channel)
+    end
+
+    test "stage channel (type 13) applies CONNECT gate" do
+      EDA.Cache.Channel.create(%{
+        "id" => "400",
+        "guild_id" => @guild_id,
+        "type" => 13,
+        "permission_overwrites" => [
+          %{
+            "id" => @guild_id,
+            "type" => 0,
+            "allow" => "0",
+            "deny" => to_string(Permission.to_bit(:connect))
+          }
+        ]
+      })
+
+      assert {:ok, 0} = Permission.in_channel(@guild_id, @user_id, "400")
+    end
+  end
+end

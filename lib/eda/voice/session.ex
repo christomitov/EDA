@@ -4,20 +4,23 @@ defmodule EDA.Voice.Session do
 
   Uses v8 of the voice gateway protocol.
   On 4006 (session invalid), triggers a full restart (leave + rejoin)
-  to obtain fresh credentials, matching Nostrum's approach.
+  to obtain fresh credentials.
   """
 
   use WebSockex
 
   require Logger
 
-  alias EDA.Voice.{Event, Payload}
+  alias EDA.Voice.{Crypto, Dave, Event, Payload}
 
   # 4006 = session no longer valid → restart with fresh credentials
   @restart_close_codes [4006]
 
+  # 4014 = bot was disconnected from voice (kicked by admin, etc.)
+  @disconnect_close_codes [4014]
+
   # Other fatal codes → give up, don't reconnect
-  @fatal_close_codes [4004, 4009, 4011, 4014, 4016]
+  @fatal_close_codes [4004, 4009, 4011, 4016]
 
   defstruct [
     :guild_id,
@@ -35,7 +38,10 @@ defmodule EDA.Voice.Session do
     :heartbeat_ref,
     heartbeat_ack: true,
     ready: false,
-    seq_ack: 0
+    listening: false,
+    seq_ack: 0,
+    ssrc_map: %{},
+    dave_manager: nil
   ]
 
   @type t :: %__MODULE__{}
@@ -87,6 +93,21 @@ defmodule EDA.Voice.Session do
   end
 
   @doc """
+  Enables continuous audio receiving for the given guild.
+  Incoming voice packets will be dispatched as `VOICE_AUDIO` events.
+  """
+  def start_listening(guild_id) do
+    WebSockex.cast(via(guild_id), :start_listening)
+  end
+
+  @doc """
+  Disables continuous audio receiving for the given guild.
+  """
+  def stop_listening(guild_id) do
+    WebSockex.cast(via(guild_id), :stop_listening)
+  end
+
+  @doc """
   Returns the registry-based name for a voice session.
   """
   def via(guild_id) do
@@ -111,6 +132,16 @@ defmodule EDA.Voice.Session do
 
     cleanup_state(state)
     EDA.Voice.restart_session(state.guild_id)
+    {:ok, %{state | ready: false, udp_socket: nil, secret_key: nil}}
+  end
+
+  # 4014 → bot was disconnected from voice (kicked by admin, channel deleted, etc.)
+  def handle_disconnect(%{reason: {:remote, code, _msg}}, state)
+      when code in @disconnect_close_codes do
+    Logger.info("Voice session ended for guild #{state.guild_id} (disconnected)")
+
+    cleanup_state(state)
+    EDA.Voice.voice_disconnected(state.guild_id)
     {:ok, %{state | ready: false, udp_socket: nil, secret_key: nil}}
   end
 
@@ -166,6 +197,29 @@ defmodule EDA.Voice.Session do
     {:reply, {:text, Jason.encode!(payload)}, state}
   end
 
+  def handle_cast(:start_listening, %{udp_socket: socket, ready: true} = state)
+      when not is_nil(socket) do
+    :inet.setopts(socket, active: true)
+    Logger.info("Voice listening enabled for guild #{state.guild_id}")
+    {:ok, %{state | listening: true}}
+  end
+
+  def handle_cast(:start_listening, state) do
+    Logger.warning("Cannot start listening: voice not ready for guild #{state.guild_id}")
+    {:ok, state}
+  end
+
+  def handle_cast(:stop_listening, %{udp_socket: socket, listening: true} = state)
+      when not is_nil(socket) do
+    :inet.setopts(socket, active: false)
+    Logger.info("Voice listening disabled for guild #{state.guild_id}")
+    {:ok, %{state | listening: false}}
+  end
+
+  def handle_cast(:stop_listening, state) do
+    {:ok, %{state | listening: false}}
+  end
+
   @impl true
   def handle_info(:voice_heartbeat, state) do
     if state.heartbeat_ack do
@@ -191,12 +245,54 @@ defmodule EDA.Voice.Session do
     {:reply, {:text, Jason.encode!(select)}, new_state}
   end
 
+  # Only process RTP voice packets (payload type 120 = opus), skip RTCP and others
+  def handle_info(
+        {:udp, _socket, _ip, _port, <<_::8, pt, _::binary>> = packet},
+        %{listening: true} = state
+      )
+      when (pt == 0x78 or pt == 0xF8) and byte_size(packet) >= 12 do
+    handle_voice_packet(packet, state)
+    {:ok, state}
+  end
+
+  def handle_info({:udp, _socket, _ip, _port, _packet}, state), do: {:ok, state}
+
   def handle_info(_msg, state), do: {:ok, state}
 
   # Private
 
+  defp handle_voice_packet(packet, state) do
+    <<_ver, _type, _seq::16, _ts::32, ssrc::32-big, _rest::binary>> = packet
+
+    case Crypto.decrypt_packet(packet, state.secret_key, state.encryption_mode) do
+      {:ok, opus_data} ->
+        user_id = Map.get(state.ssrc_map, ssrc)
+        opus_data = maybe_dave_decrypt(opus_data, state.dave_manager, user_id)
+
+        EDA.Gateway.Events.dispatch("VOICE_AUDIO", %{
+          "guild_id" => state.guild_id,
+          "user_id" => user_id,
+          "ssrc" => ssrc,
+          "opus" => opus_data
+        })
+
+      :error ->
+        Logger.debug("Decrypt failed size=#{byte_size(packet)} ssrc=#{ssrc}")
+    end
+  end
+
+  defp maybe_dave_decrypt(opus_data, %Dave.Manager{} = mgr, user_id) when not is_nil(user_id) do
+    case Dave.Manager.decrypt_frame(mgr, opus_data, String.to_integer(user_id)) do
+      {:ok, decrypted, _updated_mgr} -> decrypted
+      {:error, _} -> opus_data
+    end
+  end
+
+  defp maybe_dave_decrypt(opus_data, _manager, _user_id), do: opus_data
+
   defp cleanup_state(state) do
     if state.heartbeat_ref, do: Process.cancel_timer(state.heartbeat_ref)
+    if state.listening && state.udp_socket, do: :inet.setopts(state.udp_socket, active: false)
     if state.udp_socket, do: :gen_udp.close(state.udp_socket)
   end
 

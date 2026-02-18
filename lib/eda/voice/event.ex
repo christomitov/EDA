@@ -11,7 +11,7 @@ defmodule EDA.Voice.Event do
 
   require Logger
 
-  alias EDA.Voice.{Audio, Crypto, Payload}
+  alias EDA.Voice.{Audio, Crypto, Dave, Payload}
 
   @doc """
   Handles a decoded voice gateway payload and returns updated state.
@@ -32,12 +32,15 @@ defmodule EDA.Voice.Event do
         "session=#{state.session_id} token=#{String.slice(state.token || "", 0..7)}..."
     )
 
+    dave_version = if Application.get_env(:eda, :dave, false), do: 1, else: 0
+
     identify =
       Payload.identify(
         state.guild_id,
         user_id,
         state.session_id,
-        state.token
+        state.token,
+        dave_version
       )
 
     {:reply, identify, %{state | heartbeat_interval: interval, heartbeat_ref: ref}}
@@ -70,19 +73,39 @@ defmodule EDA.Voice.Event do
     # SESSION_DESCRIPTION - we have the secret key, voice is ready!
     secret_key = data["secret_key"] |> :erlang.list_to_binary()
     mode = data["mode"]
+    dave_version = get_in(data, ["dave", "protocol_version"]) || 0
 
-    Logger.info("Voice session established, encryption: #{mode}")
+    Logger.info(
+      "Voice session established, encryption: #{mode}" <>
+        if(dave_version > 0, do: ", DAVE v#{dave_version}", else: "")
+    )
 
     new_state = %{state | secret_key: secret_key, encryption_mode: mode, ready: true}
+
+    # Initialize DAVE manager if E2EE is negotiated
+    new_state =
+      if dave_version > 0 do
+        me = EDA.Cache.me()
+        user_id = String.to_integer(me["id"])
+
+        dave_manager =
+          Dave.Manager.new(dave_version, user_id, String.to_integer(state.guild_id))
+
+        %{new_state | dave_manager: dave_manager}
+      else
+        new_state
+      end
+
+    # Notify the Voice GenServer that we're ready BEFORE dispatching to the
+    # consumer, so that start_listening/play calls from the consumer handler
+    # see ready: true (avoids race condition).
+    EDA.Voice.voice_ready(state.guild_id, new_state)
 
     # Dispatch VOICE_READY event to the consumer
     EDA.Gateway.Events.dispatch("VOICE_READY", %{
       "guild_id" => state.guild_id,
       "channel_id" => state.channel_id
     })
-
-    # Notify the Voice GenServer that we're ready
-    EDA.Voice.voice_ready(state.guild_id, new_state)
 
     {:ok, new_state}
   end
@@ -97,6 +120,45 @@ defmodule EDA.Voice.Event do
     # RESUMED
     Logger.info("Voice session resumed")
     {:ok, state}
+  end
+
+  def handle(%{"op" => 5, "d" => data}, state) do
+    # SPEAKING — maps SSRC to user_id and notifies when users start/stop speaking
+    ssrc = data["ssrc"]
+    user_id = data["user_id"]
+    speaking = data["speaking"]
+
+    new_ssrc_map = Map.put(state.ssrc_map, ssrc, user_id)
+
+    event = if speaking > 0, do: "VOICE_SPEAKING_START", else: "VOICE_SPEAKING_STOP"
+
+    EDA.Gateway.Events.dispatch(event, %{
+      "guild_id" => state.guild_id,
+      "user_id" => user_id,
+      "ssrc" => ssrc
+    })
+
+    {:ok, %{state | ssrc_map: new_ssrc_map}}
+  end
+
+  # DAVE opcodes 21-31 — delegate to Dave.Manager
+  def handle(%{"op" => op, "d" => data}, %{dave_manager: %Dave.Manager{}} = state)
+      when op in 21..31 do
+    {updated_manager, replies} = Dave.Manager.handle_mls_event(state.dave_manager, op, data)
+    new_state = %{state | dave_manager: updated_manager}
+
+    # If DAVE is now ready after a transition, dispatch event
+    if op == 22 do
+      EDA.Gateway.Events.dispatch("VOICE_DAVE_READY", %{
+        "guild_id" => state.guild_id,
+        "channel_id" => state.channel_id
+      })
+    end
+
+    case replies do
+      [payload | _rest] -> {:reply, payload, new_state}
+      [] -> {:ok, new_state}
+    end
   end
 
   def handle(payload, state) do

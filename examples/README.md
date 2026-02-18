@@ -40,7 +40,7 @@ defmodule MyBot.Consumer do
   def handle_event({:MESSAGE_CREATE, msg}) do
     case msg["content"] do
       "!ping" ->
-        EDA.REST.Client.create_message(msg["channel_id"], "Pong!")
+        EDA.API.Message.create(msg["channel_id"], "Pong!")
       _ ->
         :ok
     end

@@ -12,6 +12,7 @@ defmodule EDA.Cache.Member do
   use GenServer
 
   @table :eda_members
+  @cache_name :members
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
@@ -25,8 +26,13 @@ defmodule EDA.Cache.Member do
     key = {to_string(guild_id), to_string(user_id)}
 
     case :ets.lookup(@table, key) do
-      [{_, member}] -> member
-      [] -> nil
+      [{_, member}] ->
+        :telemetry.execute([:eda, :cache, :hit], %{count: 1}, %{cache: @cache_name})
+        member
+
+      [] ->
+        :telemetry.execute([:eda, :cache, :miss], %{count: 1}, %{cache: @cache_name})
+        nil
     end
   end
 
@@ -50,8 +56,23 @@ defmodule EDA.Cache.Member do
     user_id = to_string(member["user"]["id"])
     key = {guild_id, user_id}
     member_with_guild = Map.put(member, "guild_id", guild_id)
-    :ets.insert(@table, {key, member_with_guild})
-    member_with_guild
+
+    case EDA.Cache.Policy.check(
+           EDA.Cache.Config.policy(@cache_name),
+           :member,
+           key,
+           member_with_guild
+         ) do
+      :cache ->
+        :ets.insert(@table, {key, member_with_guild})
+        EDA.Cache.Evictor.touch(@table, key)
+        :telemetry.execute([:eda, :cache, :write], %{count: 1}, %{cache: @cache_name})
+        member_with_guild
+
+      :skip ->
+        :telemetry.execute([:eda, :cache, :skip], %{count: 1}, %{cache: @cache_name})
+        member_with_guild
+    end
   end
 
   @doc """
@@ -77,7 +98,9 @@ defmodule EDA.Cache.Member do
   """
   @spec delete(String.t() | integer(), String.t() | integer()) :: :ok
   def delete(guild_id, user_id) do
-    :ets.delete(@table, {to_string(guild_id), to_string(user_id)})
+    key = {to_string(guild_id), to_string(user_id)}
+    :ets.delete(@table, key)
+    EDA.Cache.Evictor.remove(@table, key)
     :ok
   end
 

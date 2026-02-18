@@ -34,18 +34,17 @@ defmodule EDA.Voice.Crypto.ChaCha do
 
   Returns `{:ok, plaintext}` or `:error`.
   """
-  @spec decrypt(binary(), binary()) :: {:ok, binary()} | :error
-  def decrypt(packet, secret_key) do
+  @spec decrypt(binary(), binary(), integer()) :: {:ok, binary()} | :error
+  def decrypt(packet, secret_key, header_size) do
     packet_size = byte_size(packet)
     nonce_offset = packet_size - 4
-    tag_offset = nonce_offset - @tag_length
 
-    <<rtp_header::binary-size(@aad_length), ciphertext_and_tag::binary>> =
+    <<rtp_header::binary-size(header_size), ciphertext_and_tag::binary>> =
       binary_part(packet, 0, nonce_offset)
 
     <<nonce_bytes::binary-size(4)>> = binary_part(packet, nonce_offset, 4)
 
-    ciphertext_len = tag_offset - @aad_length
+    ciphertext_len = nonce_offset - header_size - @tag_length
 
     <<ciphertext::binary-size(ciphertext_len), tag::binary-size(@tag_length)>> =
       ciphertext_and_tag

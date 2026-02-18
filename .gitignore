@@ -25,9 +25,21 @@ eda-*.tar
 # Test bot (not part of the library)
 /test_bot/
 
-# Reference implementation (not part of the library)
-/nostrum/
+# Voice recordings (test artifacts)
+/recordings/
+
+# Dialyzer PLTs
+/priv/plts/
+
+# Rust NIF build artifacts
+native/*/target/
+
+# Hex build unpacked directory
+/eda-*/
 
 # IDE
 .idea/
+
+# Claude Code
+.claude/
 

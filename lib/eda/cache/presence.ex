@@ -12,6 +12,7 @@ defmodule EDA.Cache.Presence do
   use GenServer
 
   @table :eda_presences
+  @cache_name :presences
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
@@ -25,8 +26,13 @@ defmodule EDA.Cache.Presence do
     key = {to_string(guild_id), to_string(user_id)}
 
     case :ets.lookup(@table, key) do
-      [{_, presence}] -> presence
-      [] -> nil
+      [{_, presence}] ->
+        :telemetry.execute([:eda, :cache, :hit], %{count: 1}, %{cache: @cache_name})
+        presence
+
+      [] ->
+        :telemetry.execute([:eda, :cache, :miss], %{count: 1}, %{cache: @cache_name})
+        nil
     end
   end
 
@@ -56,7 +62,22 @@ defmodule EDA.Cache.Presence do
 
     key = {guild_id, user_id}
     presence = Map.put(data, "guild_id", guild_id)
-    :ets.insert(@table, {key, presence})
+
+    case EDA.Cache.Policy.check(
+           EDA.Cache.Config.policy(@cache_name),
+           :presence,
+           key,
+           presence
+         ) do
+      :cache ->
+        :ets.insert(@table, {key, presence})
+        EDA.Cache.Evictor.touch(@table, key)
+        :telemetry.execute([:eda, :cache, :write], %{count: 1}, %{cache: @cache_name})
+
+      :skip ->
+        :telemetry.execute([:eda, :cache, :skip], %{count: 1}, %{cache: @cache_name})
+    end
+
     :ok
   end
 

@@ -50,7 +50,7 @@ defmodule EDA.VoiceTest do
     end
 
     test "playback_finished is a no-op for unknown guild" do
-      EDA.Voice.playback_finished("unknown_guild")
+      EDA.Voice.playback_finished("unknown_guild", 0, 0, 0)
     end
   end
 

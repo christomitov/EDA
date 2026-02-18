@@ -1,0 +1,419 @@
+defmodule EDA.Permission do
+  @moduledoc """
+  Discord permission flags and calculator.
+
+  Computes effective permissions for a member at guild or channel level,
+  following Discord's official algorithm with the 3-tier overwrite cascade.
+
+  ## Features
+
+  - **Correct 3-tier overwrite cascade**: @everyone → roles (merged) → member
+  - **Access gates**: returns `0` if VIEW_CHANNEL is missing, or if
+    VOICE_CONNECT is missing on voice/stage channels
+  - **`has_permission?/3`**: one-call convenience for permission checks
+  - **Pure bitwise hot path**: no atom-list conversion during calculation
+  - **All 50+ Discord permissions** up to date (bit 52)
+  - **Nil-safe**: returns `{:error, reason}` instead of crashing on missing data
+
+  ## Usage
+
+      # Check if a member can manage messages in a channel
+      EDA.Permission.has_permission?(guild_id, user_id, channel_id, :manage_messages)
+
+      # Get all effective permissions in a channel
+      {:ok, bitset} = EDA.Permission.in_channel(guild_id, user_id, channel_id)
+      perms = EDA.Permission.to_list(bitset)
+
+      # Guild-level permissions
+      {:ok, bitset} = EDA.Permission.in_guild(guild_id, user_id)
+  """
+
+  import Bitwise
+
+  # ── Permission Flags ──────────────────────────────────────────────
+
+  @flags %{
+    create_instant_invite: 1 <<< 0,
+    kick_members: 1 <<< 1,
+    ban_members: 1 <<< 2,
+    administrator: 1 <<< 3,
+    manage_channels: 1 <<< 4,
+    manage_guild: 1 <<< 5,
+    add_reactions: 1 <<< 6,
+    view_audit_log: 1 <<< 7,
+    priority_speaker: 1 <<< 8,
+    stream: 1 <<< 9,
+    view_channel: 1 <<< 10,
+    send_messages: 1 <<< 11,
+    send_tts_messages: 1 <<< 12,
+    manage_messages: 1 <<< 13,
+    embed_links: 1 <<< 14,
+    attach_files: 1 <<< 15,
+    read_message_history: 1 <<< 16,
+    mention_everyone: 1 <<< 17,
+    use_external_emojis: 1 <<< 18,
+    view_guild_insights: 1 <<< 19,
+    connect: 1 <<< 20,
+    speak: 1 <<< 21,
+    mute_members: 1 <<< 22,
+    deafen_members: 1 <<< 23,
+    move_members: 1 <<< 24,
+    use_vad: 1 <<< 25,
+    change_nickname: 1 <<< 26,
+    manage_nicknames: 1 <<< 27,
+    manage_roles: 1 <<< 28,
+    manage_webhooks: 1 <<< 29,
+    manage_guild_expressions: 1 <<< 30,
+    use_application_commands: 1 <<< 31,
+    request_to_speak: 1 <<< 32,
+    manage_events: 1 <<< 33,
+    manage_threads: 1 <<< 34,
+    create_public_threads: 1 <<< 35,
+    create_private_threads: 1 <<< 36,
+    use_external_stickers: 1 <<< 37,
+    send_messages_in_threads: 1 <<< 38,
+    use_embedded_activities: 1 <<< 39,
+    moderate_members: 1 <<< 40,
+    view_creator_monetization_analytics: 1 <<< 41,
+    use_soundboard: 1 <<< 42,
+    create_guild_expressions: 1 <<< 43,
+    create_events: 1 <<< 44,
+    use_external_sounds: 1 <<< 45,
+    send_voice_messages: 1 <<< 46,
+    set_voice_channel_status: 1 <<< 48,
+    send_polls: 1 <<< 49,
+    use_external_apps: 1 <<< 50,
+    pin_messages: 1 <<< 51,
+    bypass_slowmode: 1 <<< 52
+  }
+
+  @all_permissions Map.values(@flags) |> Enum.reduce(0, &bor/2)
+
+  @bit_to_flag Map.new(@flags, fn {k, v} -> {v, k} end)
+
+  @max_bit 52
+
+  # Voice and stage channel types
+  @voice_types [2, 13]
+
+  @type flag ::
+          :create_instant_invite
+          | :kick_members
+          | :ban_members
+          | :administrator
+          | :manage_channels
+          | :manage_guild
+          | :add_reactions
+          | :view_audit_log
+          | :priority_speaker
+          | :stream
+          | :view_channel
+          | :send_messages
+          | :send_tts_messages
+          | :manage_messages
+          | :embed_links
+          | :attach_files
+          | :read_message_history
+          | :mention_everyone
+          | :use_external_emojis
+          | :view_guild_insights
+          | :connect
+          | :speak
+          | :mute_members
+          | :deafen_members
+          | :move_members
+          | :use_vad
+          | :change_nickname
+          | :manage_nicknames
+          | :manage_roles
+          | :manage_webhooks
+          | :manage_guild_expressions
+          | :use_application_commands
+          | :request_to_speak
+          | :manage_events
+          | :manage_threads
+          | :create_public_threads
+          | :create_private_threads
+          | :use_external_stickers
+          | :send_messages_in_threads
+          | :use_embedded_activities
+          | :moderate_members
+          | :view_creator_monetization_analytics
+          | :use_soundboard
+          | :create_guild_expressions
+          | :create_events
+          | :use_external_sounds
+          | :send_voice_messages
+          | :set_voice_channel_status
+          | :send_polls
+          | :use_external_apps
+          | :pin_messages
+          | :bypass_slowmode
+
+  @type bitset :: non_neg_integer()
+
+  # ── Conversion Functions ──────────────────────────────────────────
+
+  @doc "Returns the bit value for a permission flag."
+  @spec to_bit(flag()) :: bitset()
+  def to_bit(flag) when is_map_key(@flags, flag), do: Map.fetch!(@flags, flag)
+
+  @doc "Returns the flag atom for a bit value, or `:error`."
+  @spec from_bit(bitset()) :: {:ok, flag()} | :error
+  def from_bit(bit) do
+    case Map.fetch(@bit_to_flag, bit) do
+      {:ok, _} = ok -> ok
+      :error -> :error
+    end
+  end
+
+  @doc "Converts a list of flag atoms to a combined bitset."
+  @spec to_bitset([flag()]) :: bitset()
+  def to_bitset(flags) when is_list(flags) do
+    Enum.reduce(flags, 0, fn flag, acc -> acc ||| Map.fetch!(@flags, flag) end)
+  end
+
+  @doc "Converts a bitset to a list of flag atoms. Unknown bits are skipped."
+  @spec to_list(bitset()) :: [flag()]
+  def to_list(bitset) when is_integer(bitset) do
+    for i <- 0..@max_bit,
+        mask = 1 <<< i,
+        (bitset &&& mask) == mask,
+        flag = Map.get(@bit_to_flag, mask),
+        flag != nil,
+        do: flag
+  end
+
+  @doc "Returns the bitset with all permissions set."
+  @spec all() :: bitset()
+  def all, do: @all_permissions
+
+  @doc "Returns all known permission flag atoms."
+  @spec all_flags() :: [flag()]
+  def all_flags, do: Map.keys(@flags)
+
+  @doc "Checks if a specific flag is set in a bitset."
+  @spec has?(bitset(), flag()) :: boolean()
+  def has?(bitset, flag) when is_integer(bitset) and is_map_key(@flags, flag) do
+    bit = Map.fetch!(@flags, flag)
+    (bitset &&& bit) == bit
+  end
+
+  # ── Permission Calculator ─────────────────────────────────────────
+
+  @doc """
+  Computes effective guild-level permissions for a member.
+
+  Returns `{:ok, bitset}` or `{:error, reason}`.
+
+  ## Algorithm
+  1. Guild owner → ALL_PERMISSIONS
+  2. OR all role permission bits together
+  3. If ADMINISTRATOR is set → ALL_PERMISSIONS
+  """
+  @spec in_guild(String.t(), String.t()) :: {:ok, bitset()} | {:error, term()}
+  def in_guild(guild_id, user_id) do
+    guild_id = to_string(guild_id)
+    user_id = to_string(user_id)
+
+    with {:guild, guild} when guild != nil <- {:guild, EDA.Cache.get_guild(guild_id)},
+         {:member, member} when member != nil <-
+           {:member, EDA.Cache.get_member(guild_id, user_id)} do
+      {:ok, compute_guild_permissions(guild, member)}
+    else
+      {:guild, nil} -> {:error, :guild_not_found}
+      {:member, nil} -> {:error, :member_not_found}
+    end
+  end
+
+  @doc """
+  Computes effective channel-level permissions for a member.
+
+  Returns `{:ok, bitset}` or `{:error, reason}`.
+
+  ## Algorithm (matches Discord's official spec + JDA)
+  1. Owner → ALL_PERMISSIONS
+  2. Compute guild base permissions
+  3. ADMINISTRATOR → ALL_PERMISSIONS (skips all overwrites)
+  4. Apply 3-tier overwrite cascade:
+     a. @everyone role overwrite
+     b. All role overwrites (merged via OR, then applied)
+     c. Member-specific overwrite (highest priority)
+  5. Access gate: no VIEW_CHANNEL → 0
+  6. Access gate: voice/stage channel + no CONNECT → 0
+  """
+  @spec in_channel(String.t(), String.t(), String.t()) :: {:ok, bitset()} | {:error, term()}
+  def in_channel(guild_id, user_id, channel_id) do
+    guild_id = to_string(guild_id)
+    user_id = to_string(user_id)
+    channel_id = to_string(channel_id)
+
+    with {:guild, guild} when guild != nil <- {:guild, EDA.Cache.get_guild(guild_id)},
+         {:member, member} when member != nil <-
+           {:member, EDA.Cache.get_member(guild_id, user_id)},
+         {:channel, channel} when channel != nil <- {:channel, EDA.Cache.get_channel(channel_id)} do
+      {:ok, compute_channel_permissions(guild, member, channel)}
+    else
+      {:guild, nil} -> {:error, :guild_not_found}
+      {:member, nil} -> {:error, :member_not_found}
+      {:channel, nil} -> {:error, :channel_not_found}
+    end
+  end
+
+  @doc """
+  Checks if a member has a specific permission in a channel.
+
+  Convenience function — most common use case for bots.
+  """
+  @spec has_permission?(String.t(), String.t(), String.t(), flag()) :: boolean()
+  def has_permission?(guild_id, user_id, channel_id, permission) do
+    case in_channel(guild_id, user_id, channel_id) do
+      {:ok, bitset} -> has?(bitset, permission)
+      {:error, _} -> false
+    end
+  end
+
+  @doc """
+  Checks if a member has a specific permission at guild level.
+  """
+  @spec has_guild_permission?(String.t(), String.t(), flag()) :: boolean()
+  def has_guild_permission?(guild_id, user_id, permission) do
+    case in_guild(guild_id, user_id) do
+      {:ok, bitset} -> has?(bitset, permission)
+      {:error, _} -> false
+    end
+  end
+
+  # ── Internal: Guild-Level ─────────────────────────────────────────
+
+  @doc false
+  def compute_guild_permissions(guild, member) do
+    user_id = get_user_id(member)
+
+    if guild["owner_id"] == user_id do
+      @all_permissions
+    else
+      base = aggregate_role_permissions(guild, member)
+
+      if (base &&& @flags.administrator) == @flags.administrator,
+        do: @all_permissions,
+        else: base
+    end
+  end
+
+  defp aggregate_role_permissions(guild, member) do
+    everyone_role_id = guild["id"]
+    member_role_ids = [everyone_role_id | member["roles"] || []]
+
+    Enum.reduce(member_role_ids, 0, fn role_id, acc ->
+      case EDA.Cache.get_role(role_id) do
+        nil -> acc
+        role -> acc ||| parse_permissions(role["permissions"])
+      end
+    end)
+  end
+
+  # ── Internal: Channel-Level ───────────────────────────────────────
+
+  @doc false
+  def compute_channel_permissions(guild, member, channel) do
+    user_id = get_user_id(member)
+
+    cond do
+      guild["owner_id"] == user_id ->
+        @all_permissions
+
+      admin?(compute_guild_permissions(guild, member)) ->
+        @all_permissions
+
+      true ->
+        base = compute_guild_permissions(guild, member)
+        perms = apply_overwrites(base, guild, member, channel)
+        apply_access_gates(perms, channel)
+    end
+  end
+
+  defp admin?(bitset), do: (bitset &&& @flags.administrator) == @flags.administrator
+
+  defp apply_access_gates(perms, channel) do
+    cond do
+      (perms &&& @flags.view_channel) != @flags.view_channel ->
+        0
+
+      (channel["type"] || 0) in @voice_types and (perms &&& @flags.connect) != @flags.connect ->
+        0
+
+      true ->
+        perms
+    end
+  end
+
+  # ── Internal: 3-Tier Overwrite Cascade ────────────────────────────
+  # Matches Discord's official algorithm and JDA's PermissionUtil.
+  #
+  # Tier 1: @everyone role overwrite
+  # Tier 2: All role overwrites (merged via OR)
+  # Tier 3: Member-specific overwrite
+  #
+  # We apply each tier sequentially so member overwrites always win.
+
+  defp apply_overwrites(base, guild, member, channel) do
+    overwrites = channel["permission_overwrites"] || []
+    everyone_role_id = to_string(guild["id"])
+    user_id = get_user_id(member)
+    member_role_ids = MapSet.new(Enum.map(member["roles"] || [], &to_string/1))
+
+    # Index overwrites by ID for O(1) lookup
+    overwrite_map = Map.new(overwrites, fn ow -> {to_string(ow["id"]), ow} end)
+
+    # Tier 1: @everyone overwrite
+    {allow, deny} =
+      case Map.get(overwrite_map, everyone_role_id) do
+        nil -> {0, 0}
+        ow -> {parse_permissions(ow["allow"]), parse_permissions(ow["deny"])}
+      end
+
+    # Tier 2: Role overwrites (merged via OR, then cascade over tier 1)
+    {role_allow, role_deny} =
+      Enum.reduce(overwrites, {0, 0}, fn ow, {ra, rd} ->
+        ow_id = to_string(ow["id"])
+
+        if ow_id != everyone_role_id and MapSet.member?(member_role_ids, ow_id) do
+          {ra ||| parse_permissions(ow["allow"]), rd ||| parse_permissions(ow["deny"])}
+        else
+          {ra, rd}
+        end
+      end)
+
+    # Role cascade overrides @everyone: role allows cancel @everyone denies, etc.
+    allow = (allow &&& bnot(role_deny)) ||| role_allow
+    deny = (deny &&& bnot(role_allow)) ||| role_deny
+
+    # Tier 3: Member-specific overwrite
+    {allow, deny} =
+      case Map.get(overwrite_map, user_id) do
+        nil ->
+          {allow, deny}
+
+        ow ->
+          member_allow = parse_permissions(ow["allow"])
+          member_deny = parse_permissions(ow["deny"])
+
+          {(allow &&& bnot(member_deny)) ||| member_allow,
+           (deny &&& bnot(member_allow)) ||| member_deny}
+      end
+
+    # Apply: strip denied, grant allowed
+    (base &&& bnot(deny)) ||| allow
+  end
+
+  # ── Helpers ───────────────────────────────────────────────────────
+
+  defp get_user_id(%{"user" => %{"id" => id}}), do: to_string(id)
+  defp get_user_id(%{"user_id" => id}), do: to_string(id)
+
+  # Discord sends permissions as string integers in API v10
+  defp parse_permissions(nil), do: 0
+  defp parse_permissions(n) when is_integer(n), do: n
+  defp parse_permissions(s) when is_binary(s), do: String.to_integer(s)
+end

@@ -37,7 +37,7 @@ defmodule EDA.Voice.Crypto.ChaChaTest do
       frame = :crypto.strong_rand_bytes(12 + 160)
       encrypted = ChaCha.encrypt(frame, @secret_key, 0)
 
-      assert {:ok, decrypted} = ChaCha.decrypt(encrypted, @secret_key)
+      assert {:ok, decrypted} = ChaCha.decrypt(encrypted, @secret_key, 12)
       <<_rtp::binary-size(12), payload::binary>> = frame
       assert decrypted == payload
     end
@@ -46,7 +46,7 @@ defmodule EDA.Voice.Crypto.ChaChaTest do
       for nonce <- [0, 1, 255, 65_535, 16_777_215] do
         frame = :crypto.strong_rand_bytes(12 + 80)
         encrypted = ChaCha.encrypt(frame, @secret_key, nonce)
-        assert {:ok, _} = ChaCha.decrypt(encrypted, @secret_key)
+        assert {:ok, _} = ChaCha.decrypt(encrypted, @secret_key, 12)
       end
     end
 
@@ -55,7 +55,7 @@ defmodule EDA.Voice.Crypto.ChaChaTest do
       encrypted = ChaCha.encrypt(frame, @secret_key, 0)
 
       wrong_key = :crypto.strong_rand_bytes(32)
-      assert :error = ChaCha.decrypt(encrypted, wrong_key)
+      assert :error = ChaCha.decrypt(encrypted, wrong_key, 12)
     end
 
     test "fails with tampered ciphertext" do
@@ -65,7 +65,7 @@ defmodule EDA.Voice.Crypto.ChaChaTest do
       <<header::binary-size(12), byte, rest::binary>> = encrypted
       tampered = header <> <<Bitwise.bxor(byte, 0xFF)>> <> rest
 
-      assert :error = ChaCha.decrypt(tampered, @secret_key)
+      assert :error = ChaCha.decrypt(tampered, @secret_key, 12)
     end
   end
 

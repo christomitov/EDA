@@ -12,6 +12,7 @@ defmodule EDA.Cache.VoiceState do
   use GenServer
 
   @table :eda_voice_states
+  @cache_name :voice_states
 
   def start_link(_opts) do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
@@ -25,8 +26,13 @@ defmodule EDA.Cache.VoiceState do
     key = {to_string(guild_id), to_string(user_id)}
 
     case :ets.lookup(@table, key) do
-      [{_, voice_state}] -> voice_state
-      [] -> nil
+      [{_, voice_state}] ->
+        :telemetry.execute([:eda, :cache, :hit], %{count: 1}, %{cache: @cache_name})
+        voice_state
+
+      [] ->
+        :telemetry.execute([:eda, :cache, :miss], %{count: 1}, %{cache: @cache_name})
+        nil
     end
   end
 
@@ -65,10 +71,25 @@ defmodule EDA.Cache.VoiceState do
     case data["channel_id"] do
       nil ->
         :ets.delete(@table, key)
+        EDA.Cache.Evictor.remove(@table, key)
 
       _channel_id ->
         voice_state = Map.put(data, "guild_id", guild_id)
-        :ets.insert(@table, {key, voice_state})
+
+        case EDA.Cache.Policy.check(
+               EDA.Cache.Config.policy(@cache_name),
+               :voice_state,
+               key,
+               voice_state
+             ) do
+          :cache ->
+            :ets.insert(@table, {key, voice_state})
+            EDA.Cache.Evictor.touch(@table, key)
+            :telemetry.execute([:eda, :cache, :write], %{count: 1}, %{cache: @cache_name})
+
+          :skip ->
+            :telemetry.execute([:eda, :cache, :skip], %{count: 1}, %{cache: @cache_name})
+        end
     end
 
     :ok

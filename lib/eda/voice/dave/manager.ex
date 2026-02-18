@@ -1,0 +1,246 @@
+defmodule EDA.Voice.Dave.Manager do
+  @moduledoc """
+  Coordinates the DAVE (Discord Audio Video E2EE) protocol.
+
+  This is a pure struct (not a GenServer) to avoid bottlenecks on the
+  audio hot path (50 frames/sec). The NIF resource is thread-safe
+  (Mutex on the Rust side).
+
+  When `protocol_version` is 0, all operations are passthrough (zero-cost).
+  """
+
+  require Logger
+
+  alias EDA.Voice.Dave.Native
+  alias EDA.Voice.Payload
+
+  defstruct [
+    :mls_session,
+    :protocol_version,
+    :user_id,
+    :channel_id,
+    :transition_id,
+    pending_epoch: nil
+  ]
+
+  @type t :: %__MODULE__{
+          mls_session: reference() | nil,
+          protocol_version: non_neg_integer(),
+          user_id: non_neg_integer(),
+          channel_id: non_neg_integer(),
+          transition_id: non_neg_integer() | nil,
+          pending_epoch: non_neg_integer() | nil
+        }
+
+  @doc "Creates a new DAVE manager. Version 0 means passthrough (no E2EE)."
+  @spec new(non_neg_integer(), non_neg_integer(), non_neg_integer()) :: t()
+  def new(protocol_version, user_id, channel_id) do
+    session =
+      if protocol_version > 0 do
+        case Native.new_session(protocol_version, user_id, channel_id) do
+          {:ok, ref} when is_reference(ref) ->
+            ref
+
+          ref when is_reference(ref) ->
+            ref
+
+          _ ->
+            Logger.warning("DAVE: Failed to create MLS session, falling back to passthrough")
+            nil
+        end
+      else
+        nil
+      end
+
+    %__MODULE__{
+      mls_session: session,
+      protocol_version: protocol_version,
+      user_id: user_id,
+      channel_id: channel_id
+    }
+  end
+
+  @doc "Returns true if DAVE E2EE is active (version > 0 and NIF session available)."
+  @spec active?(t()) :: boolean()
+  def active?(%__MODULE__{protocol_version: v, mls_session: s}), do: v > 0 and not is_nil(s)
+
+  @doc """
+  Encrypts an Opus frame through DAVE E2EE.
+
+  In passthrough mode, returns the frame unchanged.
+  Returns `{encrypted_frame, updated_manager}`.
+  """
+  @spec encrypt_frame(t(), binary()) :: {binary(), t()}
+  def encrypt_frame(%__MODULE__{mls_session: nil} = manager, opus_frame) do
+    {opus_frame, manager}
+  end
+
+  def encrypt_frame(%__MODULE__{mls_session: session} = manager, opus_frame) do
+    case Native.encrypt_opus(session, opus_frame) do
+      {:ok, encrypted} ->
+        {encrypted, manager}
+
+      _ ->
+        Logger.debug("DAVE: encrypt_opus failed, sending unencrypted")
+        {opus_frame, manager}
+    end
+  end
+
+  @doc """
+  Decrypts a DAVE-encrypted frame.
+
+  In passthrough mode, returns the frame unchanged.
+  Returns `{:ok, decrypted_frame, updated_manager}` or `{:error, reason}`.
+  """
+  @spec decrypt_frame(t(), binary(), non_neg_integer()) ::
+          {:ok, binary(), t()} | {:error, atom()}
+  def decrypt_frame(%__MODULE__{mls_session: nil} = manager, frame, _sender_user_id) do
+    {:ok, frame, manager}
+  end
+
+  def decrypt_frame(%__MODULE__{mls_session: session} = manager, frame, sender_user_id) do
+    case Native.decrypt_audio(session, sender_user_id, frame) do
+      {:ok, decrypted} ->
+        {:ok, decrypted, manager}
+
+      _ ->
+        :telemetry.execute([:eda, :voice, :dave, :frame_decrypt_error], %{count: 1}, %{
+          user_id: sender_user_id
+        })
+
+        {:error, :decrypt_failed}
+    end
+  end
+
+  @doc """
+  Handles an MLS-related voice gateway event.
+
+  Returns `{updated_manager, reply_payloads}` where `reply_payloads` is
+  a list of payloads to send back to the voice gateway.
+  """
+  @spec handle_mls_event(t(), non_neg_integer(), map()) :: {t(), list()}
+
+  # OP 25: DAVE_MLS_EXTERNAL_SENDER
+  def handle_mls_event(%__MODULE__{mls_session: session} = manager, 25, data)
+      when not is_nil(session) do
+    credential = Base.decode64!(data["external_sender"])
+
+    case Native.set_external_sender(session, credential) do
+      :ok ->
+        Logger.debug("DAVE: External sender set")
+        # After setting external sender, send our key package
+        case Native.create_key_package(session) do
+          {:ok, key_package} ->
+            {manager, [Payload.dave_mls_key_package(key_package)]}
+
+          _ ->
+            Logger.error("DAVE: Failed to create key package")
+            {manager, []}
+        end
+
+      :error ->
+        Logger.error("DAVE: Failed to set external sender")
+        {manager, []}
+    end
+  end
+
+  # OP 27: DAVE_MLS_PROPOSALS
+  def handle_mls_event(%__MODULE__{mls_session: session} = manager, 27, data)
+      when not is_nil(session) do
+    proposals = Base.decode64!(data["proposals"])
+
+    op_type =
+      case data["operation_type"] do
+        1 -> :revoke
+        _ -> :append
+      end
+
+    case Native.process_proposals(session, op_type, proposals) do
+      {:ok, commit, _has_welcome} when byte_size(commit) > 0 ->
+        Logger.debug("DAVE: Proposals processed, sending commit")
+        {manager, [Payload.dave_mls_commit_welcome(commit, nil)]}
+
+      {:ok, _empty, _} ->
+        Logger.debug("DAVE: Proposals processed, no commit needed")
+        {manager, []}
+
+      _ ->
+        Logger.error("DAVE: Failed to process proposals")
+        {manager, []}
+    end
+  end
+
+  # OP 29: DAVE_MLS_ANNOUNCE_COMMIT
+  def handle_mls_event(%__MODULE__{mls_session: session} = manager, 29, data)
+      when not is_nil(session) do
+    commit = Base.decode64!(data["commit"])
+    transition_id = data["transition_id"]
+
+    case Native.process_commit(session, commit) do
+      :ok ->
+        epoch = Native.get_epoch(session)
+        Logger.info("DAVE: Commit processed, epoch=#{epoch}")
+
+        :telemetry.execute([:eda, :voice, :dave, :epoch_change], %{epoch: epoch}, %{})
+
+        manager = %{manager | transition_id: transition_id, pending_epoch: epoch}
+        {manager, [Payload.dave_ready_for_transition(transition_id)]}
+
+      :error ->
+        Logger.error("DAVE: Failed to process commit")
+        {manager, []}
+    end
+  end
+
+  # OP 30: DAVE_MLS_WELCOME
+  def handle_mls_event(%__MODULE__{mls_session: session} = manager, 30, data)
+      when not is_nil(session) do
+    welcome = Base.decode64!(data["welcome"])
+
+    case Native.process_welcome(session, welcome) do
+      :ok ->
+        epoch = Native.get_epoch(session)
+        transition_id = data["transition_id"]
+        Logger.info("DAVE: Welcome processed, epoch=#{epoch}")
+
+        :telemetry.execute([:eda, :voice, :dave, :epoch_change], %{epoch: epoch}, %{})
+
+        manager = %{manager | transition_id: transition_id, pending_epoch: epoch}
+        {manager, [Payload.dave_ready_for_transition(transition_id)]}
+
+      :error ->
+        Logger.error("DAVE: Failed to process welcome")
+        {manager, []}
+    end
+  end
+
+  # OP 21: DAVE_PREPARE_TRANSITION
+  def handle_mls_event(manager, 21, data) do
+    Logger.debug("DAVE: Prepare transition, version=#{data["protocol_version"]}")
+    {manager, []}
+  end
+
+  # OP 22: DAVE_EXECUTE_TRANSITION
+  def handle_mls_event(manager, 22, _data) do
+    Logger.info("DAVE: Execute transition, epoch=#{manager.pending_epoch}")
+    {%{manager | pending_epoch: nil, transition_id: nil}, []}
+  end
+
+  # OP 24: DAVE_PREPARE_EPOCH
+  def handle_mls_event(manager, 24, data) do
+    Logger.debug("DAVE: Prepare epoch #{data["epoch"]}")
+    {manager, []}
+  end
+
+  # OP 31: DAVE_MLS_INVALID_COMMIT
+  def handle_mls_event(manager, 31, data) do
+    Logger.warning("DAVE: Invalid commit reported: #{inspect(data)}")
+    {manager, []}
+  end
+
+  # Fallback for unhandled opcodes or nil session
+  def handle_mls_event(manager, opcode, _data) do
+    Logger.debug("DAVE: Unhandled MLS opcode #{opcode}")
+    {manager, []}
+  end
+end
