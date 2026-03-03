@@ -205,10 +205,18 @@ defmodule EDA.Voice do
       "Voice.join called: guild=#{guild_id} channel=#{channel_id} opts=#{inspect(opts)}"
     )
 
-    voice_state = %State{
-      guild_id: guild_id,
-      channel_id: channel_id
-    }
+    voice_state =
+      case Map.get(state.guilds, guild_id) do
+        %State{} = existing ->
+          # Preserve session/token/ready fields on repeated joins.
+          %{existing | guild_id: guild_id, channel_id: channel_id}
+
+        nil ->
+          %State{
+            guild_id: guild_id,
+            channel_id: channel_id
+          }
+      end
 
     new_guilds = Map.put(state.guilds, guild_id, voice_state)
 
