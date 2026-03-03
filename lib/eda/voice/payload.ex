@@ -13,7 +13,8 @@ defmodule EDA.Voice.Payload do
   @doc """
   Builds an IDENTIFY payload for voice gateway authentication.
 
-  When `dave_version` is > 0, includes DAVE protocol negotiation.
+  When `dave_version` is > 0, includes DAVE protocol negotiation using
+  `max_dave_protocol_version`.
   """
   def identify(server_id, user_id, session_id, token, dave_version \\ 0) do
     d = %{
@@ -25,7 +26,7 @@ defmodule EDA.Voice.Payload do
 
     d =
       if dave_version > 0 do
-        Map.put(d, :dave, %{protocol_version: dave_version})
+        Map.put(d, :max_dave_protocol_version, dave_version)
       else
         d
       end
