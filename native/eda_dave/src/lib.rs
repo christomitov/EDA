@@ -1,4 +1,4 @@
-use davey::{DaveSession, EncryptError, ProposalsOperationType};
+use davey::{errors::EncryptError, DaveSession, ProposalsOperationType};
 use rustler::{Atom, Binary, Env, NewBinary, ResourceArc};
 use std::num::NonZeroU16;
 use std::sync::Mutex;
