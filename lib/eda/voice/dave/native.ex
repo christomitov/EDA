@@ -51,11 +51,10 @@ defmodule EDA.Voice.Dave.Native do
   Processes MLS proposals from the gateway.
 
   `operation_type` is `:append` or `:revoke`.
-  Returns `{:ok, commit_binary, :ok | :nil}` where the third element indicates
-  whether a welcome message was generated.
+  Returns `{:ok, commit_binary, welcome_binary_or_nil}`.
   """
   @spec process_proposals(reference(), :append | :revoke, binary()) ::
-          {:ok, binary(), :ok | nil}
+          {:ok, binary(), binary() | nil}
   def process_proposals(_ref, _operation_type, _proposals),
     do: :erlang.nif_error(:nif_not_loaded)
 

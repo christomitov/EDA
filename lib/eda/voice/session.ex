@@ -228,6 +228,10 @@ defmodule EDA.Voice.Session do
   def handle_frame(_frame, state), do: {:ok, state}
 
   @impl true
+  def handle_cast({:send_payload, {:binary, payload}}, state) when is_binary(payload) do
+    {:reply, {:binary, payload}, state}
+  end
+
   def handle_cast({:send_payload, payload}, state) do
     {:reply, {:text, Jason.encode!(payload)}, state}
   end
@@ -333,6 +337,11 @@ defmodule EDA.Voice.Session do
 
   defp build_url(endpoint) do
     "wss://#{endpoint}/?v=8"
+  end
+
+  defp handle_event_result({:reply, {:binary, payload}, state}) when is_binary(payload) do
+    Logger.debug("Voice WS sending binary payload (#{byte_size(payload)} bytes)")
+    {:reply, {:binary, payload}, state}
   end
 
   defp handle_event_result({:reply, payload, state}) do

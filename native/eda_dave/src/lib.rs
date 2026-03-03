@@ -72,7 +72,7 @@ fn process_proposals<'a>(
     resource: ResourceArc<DaveSessionResource>,
     operation_type: Atom,
     proposals: Binary,
-) -> Result<(Atom, Binary<'a>, Atom), Atom> {
+) -> Result<(Atom, Binary<'a>, Option<Binary<'a>>), Atom> {
     let mut session = resource.0.lock().map_err(|_| atoms::error())?;
 
     let op_type = if operation_type == atoms::revoke() {
@@ -84,17 +84,15 @@ fn process_proposals<'a>(
     match session.process_proposals(op_type, proposals.as_slice(), None) {
         Ok(Some(commit_welcome)) => {
             let commit_bin = to_binary(env, &commit_welcome.commit);
-            let has_welcome = if commit_welcome.welcome.is_some() {
-                atoms::ok()
-            } else {
-                atoms::nil()
+            let welcome_bin = match commit_welcome.welcome {
+                Some(welcome) => Some(to_binary(env, &welcome)),
+                None => None,
             };
-            // Return commit; welcome handling will be separate if needed
-            Ok((atoms::ok(), commit_bin, has_welcome))
+            Ok((atoms::ok(), commit_bin, welcome_bin))
         }
         Ok(None) => {
             // No commit needed — proposals processed, awaiting external commit
-            Ok((atoms::ok(), to_binary(env, &[]), atoms::nil()))
+            Ok((atoms::ok(), to_binary(env, &[]), None))
         }
         Err(_) => Err(atoms::error()),
     }

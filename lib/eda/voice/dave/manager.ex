@@ -169,9 +169,13 @@ defmodule EDA.Voice.Dave.Manager do
     case raw_or_base64(data, "proposals_bin", "proposals") do
       {:ok, proposals} ->
         case Native.process_proposals(session, op_type, proposals) do
-          {:ok, commit, _has_welcome} when byte_size(commit) > 0 ->
-            Logger.debug("DAVE: Proposals processed, sending commit")
-            {manager, [Payload.dave_mls_commit_welcome(commit, nil)]}
+          {:ok, commit, welcome} when byte_size(commit) > 0 ->
+            Logger.debug(
+              "DAVE: Proposals processed, sending commit" <>
+                if(is_binary(welcome), do: " + welcome", else: "")
+            )
+
+            {manager, [Payload.dave_mls_commit_welcome(commit, welcome)]}
 
           {:ok, _empty, _} ->
             Logger.debug("DAVE: Proposals processed, no commit needed")
