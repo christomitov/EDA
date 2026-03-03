@@ -90,6 +90,12 @@ defmodule EDA.Voice.Session do
   """
   def send_payload(guild_id, payload) do
     WebSockex.cast(via(guild_id), {:send_payload, payload})
+  rescue
+    ArgumentError ->
+      {:error, :not_connected}
+  catch
+    :exit, _ ->
+      {:error, :not_connected}
   end
 
   @doc """

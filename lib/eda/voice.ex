@@ -234,9 +234,16 @@ defmodule EDA.Voice do
   def handle_call({:play, guild_id, input, type}, _from, state) do
     case Map.get(state.guilds, guild_id) do
       %State{ready: true, audio_pid: nil} = voice_state ->
-        pid = Audio.play(guild_id, input, type, voice_state)
-        new_vs = %{voice_state | audio_pid: pid}
-        {:reply, :ok, put_in(state, [:guilds, guild_id], new_vs)}
+        case Registry.lookup(EDA.Voice.Registry, {:session, guild_id}) do
+          [{_session_pid, _}] ->
+            pid = Audio.play(guild_id, input, type, voice_state)
+            new_vs = %{voice_state | audio_pid: pid}
+            {:reply, :ok, put_in(state, [:guilds, guild_id], new_vs)}
+
+          [] ->
+            stale_vs = %{voice_state | ready: false}
+            {:reply, {:error, :not_connected}, put_in(state, [:guilds, guild_id], stale_vs)}
+        end
 
       %State{ready: true, audio_pid: _pid} ->
         {:reply, {:error, :already_playing}, state}
