@@ -13,7 +13,11 @@ defmodule EDA.Voice.Audio do
   # 20ms in microseconds — used for monotonic timing
   @frame_duration_us 20_000
   @opus_frame_samples 960
-  @silence_frames 5
+  # Pre-roll silence gives Discord clients time to apply SPEAKING=true before
+  # real audio begins, preventing clipped starts.
+  @pre_silence_frames 3
+  # Post-roll silence flushes the tail and helps avoid abrupt cut-off.
+  @post_silence_frames 5
   @playback_progress_table :eda_voice_playback_progress
 
   # IP Discovery
@@ -114,15 +118,36 @@ defmodule EDA.Voice.Audio do
         args: args
       ])
 
-    # Must send speaking before any audio data
+    # Must send speaking before any audio data.
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, true))
 
-    final = stream_from_port(port, guild_id, voice_state)
+    # Pre-roll silence helps avoid clipped starts while clients apply speaking state.
+    {start_seq, start_ts, start_nonce, _} =
+      send_silence(
+        guild_id,
+        voice_state,
+        voice_state.sequence,
+        voice_state.timestamp,
+        voice_state.nonce,
+        @pre_silence_frames
+      )
 
-    send_silence(guild_id, voice_state, final.seq, final.ts, final.nonce)
+    primed_voice_state = %{
+      voice_state
+      | sequence: start_seq,
+        timestamp: start_ts,
+        nonce: start_nonce
+    }
+
+    final = stream_from_port(port, guild_id, primed_voice_state)
+
+    # Keep RTP counters monotonic across clips by using post-silence end counters.
+    {tail_seq, tail_ts, tail_nonce, _} =
+      send_silence(guild_id, voice_state, final.seq, final.ts, final.nonce)
+
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, false))
 
-    EDA.Voice.playback_finished(guild_id, final.seq, final.ts, final.nonce)
+    EDA.Voice.playback_finished(guild_id, tail_seq, tail_ts, tail_nonce)
   end
 
   defp player_loop(guild_id, frames, :raw, voice_state) do
@@ -135,20 +160,34 @@ defmodule EDA.Voice.Audio do
 
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, true))
 
+    # Pre-roll silence helps avoid clipped starts while clients apply speaking state.
+    {start_seq, start_ts, start_nonce, _} =
+      send_silence(
+        guild_id,
+        voice_state,
+        voice_state.sequence,
+        voice_state.timestamp,
+        voice_state.nonce,
+        @pre_silence_frames
+      )
+
     {final_seq, final_ts, final_nonce, _} =
       send_frames(
         frames,
         guild_id,
         voice_state,
-        voice_state.sequence,
-        voice_state.timestamp,
-        voice_state.nonce
+        start_seq,
+        start_ts,
+        start_nonce
       )
 
-    send_silence(guild_id, voice_state, final_seq, final_ts, final_nonce)
+    # Keep RTP counters monotonic across clips by using post-silence end counters.
+    {tail_seq, tail_ts, tail_nonce, _} =
+      send_silence(guild_id, voice_state, final_seq, final_ts, final_nonce)
+
     Session.send_payload(guild_id, Payload.speaking(voice_state.ssrc, false))
 
-    EDA.Voice.playback_finished(guild_id, final_seq, final_ts, final_nonce)
+    EDA.Voice.playback_finished(guild_id, tail_seq, tail_ts, tail_nonce)
   end
 
   # FFmpeg outputs OGG pages via `-f ogg`. We parse those pages to get individual
@@ -330,9 +369,9 @@ defmodule EDA.Voice.Audio do
 
   defp maybe_dave_encrypt(frame, _manager), do: frame
 
-  defp send_silence(guild_id, voice_state, seq, ts, nonce) do
+  defp send_silence(guild_id, voice_state, seq, ts, nonce, frame_count \\ @post_silence_frames) do
     silence = <<0xF8, 0xFF, 0xFE>>
-    frames = List.duplicate(silence, @silence_frames)
+    frames = List.duplicate(silence, frame_count)
 
     send_frames(
       frames,
