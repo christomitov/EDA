@@ -5,33 +5,12 @@ defmodule EDA.Voice.Dave.Native do
   Wraps the `davey` Rust crate which implements the MLS (RFC 9420) key
   exchange protocol used by Discord's DAVE protocol.
 
-  The NIF is loaded at runtime via `@on_load`. If the shared library is not
-  found (e.g. Rustler was not available when EDA was compiled), all functions
-  gracefully raise `:nif_not_loaded` and `available?/0` returns false.
+  The NIF is compiled and loaded automatically via Rustler when Rust is
+  available. If the NIF cannot be loaded, all functions raise `:nif_not_loaded`
+  and `available?/0` returns false.
   """
 
-  @on_load :load_nif
-
-  @doc false
-  def load_nif do
-    path =
-      :eda
-      |> :code.priv_dir()
-      |> Path.join("native/eda_dave")
-
-    case :erlang.load_nif(String.to_charlist(path), 0) do
-      :ok ->
-        :ok
-
-      {:error, {:reload, _}} ->
-        :ok
-
-      {:error, reason} ->
-        require Logger
-        Logger.debug("DAVE NIF not available: #{inspect(reason)}")
-        :ok
-    end
-  end
+  use Rustler, otp_app: :eda, crate: "eda_dave"
 
   @doc "Creates a new MLS session for the given protocol version, user ID, and channel ID."
   @spec new_session(pos_integer(), non_neg_integer(), non_neg_integer()) ::
