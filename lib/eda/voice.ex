@@ -581,8 +581,12 @@ defmodule EDA.Voice do
   end
 
   @impl true
-  def handle_info({:EXIT, pid, _reason}, state) do
+  def handle_info({:EXIT, pid, reason}, state) do
     # Clean up audio pid if it crashed
+    if reason != :normal do
+      Logger.warning("Audio player #{inspect(pid)} exited: #{inspect(reason)}")
+    end
+
     new_guilds =
       Map.new(state.guilds, fn
         {gid, %State{audio_pid: ^pid} = vs} -> {gid, %{vs | audio_pid: nil}}

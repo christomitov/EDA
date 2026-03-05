@@ -41,7 +41,8 @@ defmodule EDA.Voice.Session do
     listening: false,
     seq_ack: 0,
     ssrc_map: %{},
-    dave_manager: nil
+    dave_manager: nil,
+    connected_clients: MapSet.new()
   ]
 
   @type t :: %__MODULE__{}
@@ -200,14 +201,8 @@ defmodule EDA.Voice.Session do
         {29, <<transition_id::16-big, commit::binary>>} ->
           %{"transition_id" => transition_id, "commit_bin" => commit}
 
-        {30, welcome_payload} ->
-          transition_id =
-            case welcome_payload do
-              <<tid::16-big, _::binary>> -> tid
-              _ -> 0
-            end
-
-          %{"transition_id" => transition_id, "welcome_bin" => welcome_payload}
+        {30, <<transition_id::16-big, welcome::binary>>} ->
+          %{"transition_id" => transition_id, "welcome_bin" => welcome}
 
         _ ->
           %{}

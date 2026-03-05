@@ -1,4 +1,4 @@
-use davey::{errors::EncryptError, DaveSession, ProposalsOperationType};
+use davey::{errors::EncryptError, DaveSession, ProposalsOperationType, SessionStatus, DAVE_PROTOCOL_VERSION};
 use rustler::{Atom, Binary, Env, NewBinary, ResourceArc};
 use std::num::NonZeroU16;
 use std::sync::Mutex;
@@ -12,6 +12,10 @@ mod atoms {
         nil,
         append,
         revoke,
+        inactive,
+        pending,
+        awaiting_response,
+        active,
     }
 }
 
@@ -39,7 +43,7 @@ fn new_session(
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn create_key_package<'a>(
     env: Env<'a>,
     resource: ResourceArc<DaveSessionResource>,
@@ -66,12 +70,13 @@ fn set_external_sender(
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn process_proposals<'a>(
     env: Env<'a>,
     resource: ResourceArc<DaveSessionResource>,
     operation_type: Atom,
     proposals: Binary,
+    user_ids: Vec<u64>,
 ) -> Result<(Atom, Binary<'a>, Option<Binary<'a>>), Atom> {
     let mut session = resource.0.lock().map_err(|_| atoms::error())?;
 
@@ -81,7 +86,9 @@ fn process_proposals<'a>(
         ProposalsOperationType::APPEND
     };
 
-    match session.process_proposals(op_type, proposals.as_slice(), None) {
+    let expected = if user_ids.is_empty() { None } else { Some(user_ids.as_slice()) };
+
+    match session.process_proposals(op_type, proposals.as_slice(), expected) {
         Ok(Some(commit_welcome)) => {
             let commit_bin = to_binary(env, &commit_welcome.commit);
             let welcome_bin = match commit_welcome.welcome {
@@ -98,7 +105,7 @@ fn process_proposals<'a>(
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn process_commit(
     resource: ResourceArc<DaveSessionResource>,
     commit: Binary,
@@ -113,7 +120,7 @@ fn process_commit(
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn process_welcome(
     resource: ResourceArc<DaveSessionResource>,
     welcome: Binary,
@@ -128,7 +135,7 @@ fn process_welcome(
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn encrypt_opus<'a>(
     env: Env<'a>,
     resource: ResourceArc<DaveSessionResource>,
@@ -142,7 +149,7 @@ fn encrypt_opus<'a>(
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn decrypt_audio<'a>(
     env: Env<'a>,
     resource: ResourceArc<DaveSessionResource>,
@@ -158,6 +165,15 @@ fn decrypt_audio<'a>(
         Ok(decrypted) => Ok((atoms::ok(), to_binary(env, &decrypted))),
         Err(_) => Err(atoms::error()),
     }
+}
+
+#[rustler::nif(name = "can_passthrough?")]
+fn can_passthrough(
+    resource: ResourceArc<DaveSessionResource>,
+    user_id: u64,
+) -> Result<bool, Atom> {
+    let session = resource.0.lock().map_err(|_| atoms::error())?;
+    Ok(session.can_passthrough(user_id))
 }
 
 #[rustler::nif]
@@ -186,6 +202,62 @@ fn set_passthrough_mode(
     };
     session.set_passthrough_mode(passthrough, None);
     atoms::ok()
+}
+
+#[rustler::nif]
+fn reset(resource: ResourceArc<DaveSessionResource>) -> Atom {
+    let mut session = match resource.0.lock() {
+        Ok(s) => s,
+        Err(_) => return atoms::error(),
+    };
+    match session.reset() {
+        Ok(()) => atoms::ok(),
+        Err(_) => atoms::error(),
+    }
+}
+
+#[rustler::nif]
+fn reinit(
+    resource: ResourceArc<DaveSessionResource>,
+    protocol_version: u16,
+    user_id: u64,
+    channel_id: u64,
+) -> Atom {
+    let pv = match NonZeroU16::new(protocol_version) {
+        Some(v) => v,
+        None => return atoms::error(),
+    };
+    let mut session = match resource.0.lock() {
+        Ok(s) => s,
+        Err(_) => return atoms::error(),
+    };
+    match session.reinit(pv, user_id, channel_id, None) {
+        Ok(()) => atoms::ok(),
+        Err(_) => atoms::error(),
+    }
+}
+
+#[rustler::nif]
+fn status(resource: ResourceArc<DaveSessionResource>) -> Result<Atom, Atom> {
+    let session = resource.0.lock().map_err(|_| atoms::error())?;
+    let atom = match session.status() {
+        SessionStatus::INACTIVE => atoms::inactive(),
+        SessionStatus::PENDING => atoms::pending(),
+        SessionStatus::AWAITING_RESPONSE => atoms::awaiting_response(),
+        SessionStatus::ACTIVE => atoms::active(),
+    };
+    Ok(atom)
+}
+
+#[rustler::nif]
+fn protocol_version(resource: ResourceArc<DaveSessionResource>) -> Result<u16, Atom> {
+    let session = resource.0.lock().map_err(|_| atoms::error())?;
+    Ok(session.protocol_version().get())
+}
+
+#[rustler::nif]
+fn max_protocol_version() -> u16 {
+    DAVE_PROTOCOL_VERSION
 }
 
 rustler::init!("Elixir.EDA.Voice.Dave.Native");

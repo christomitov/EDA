@@ -30,11 +30,12 @@ defmodule EDA.Voice.Dave.Native do
   Processes MLS proposals from the gateway.
 
   `operation_type` is `:append` or `:revoke`.
+  `user_ids` is a list of connected client user IDs (integers).
   Returns `{:ok, commit_binary, welcome_binary_or_nil}`.
   """
-  @spec process_proposals(reference(), :append | :revoke, binary()) ::
+  @spec process_proposals(reference(), :append | :revoke, binary(), [non_neg_integer()]) ::
           {:ok, binary(), binary() | nil}
-  def process_proposals(_ref, _operation_type, _proposals),
+  def process_proposals(_ref, _operation_type, _proposals, _user_ids),
     do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Processes an MLS commit from the gateway."
@@ -58,6 +59,10 @@ defmodule EDA.Voice.Dave.Native do
   @spec decrypt_audio(reference(), non_neg_integer(), binary()) :: {:ok, binary()}
   def decrypt_audio(_ref, _sender_user_id, _packet), do: :erlang.nif_error(:nif_not_loaded)
 
+  @doc "Returns true if the user's decryptor has an active passthrough (epoch transition grace period)."
+  @spec can_passthrough?(reference(), non_neg_integer()) :: boolean()
+  def can_passthrough?(_ref, _user_id), do: :erlang.nif_error(:nif_not_loaded)
+
   @doc "Returns the current MLS epoch number."
   @spec get_epoch(reference()) :: non_neg_integer()
   def get_epoch(_ref), do: :erlang.nif_error(:nif_not_loaded)
@@ -69,6 +74,27 @@ defmodule EDA.Voice.Dave.Native do
   @doc "Sets passthrough mode (disable/enable E2EE without destroying the session)."
   @spec set_passthrough_mode(reference(), boolean()) :: :ok | :error
   def set_passthrough_mode(_ref, _passthrough), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Resets the MLS group state without losing key material or external sender."
+  @spec reset(reference()) :: :ok | :error
+  def reset(_ref), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Re-initializes the session with new parameters without creating a new resource."
+  @spec reinit(reference(), pos_integer(), non_neg_integer(), non_neg_integer()) :: :ok | :error
+  def reinit(_ref, _protocol_version, _user_id, _channel_id),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Returns the session status: `:inactive`, `:pending`, `:awaiting_response`, or `:active`."
+  @spec status(reference()) :: :inactive | :pending | :awaiting_response | :active
+  def status(_ref), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Returns the DAVE protocol version of this session."
+  @spec protocol_version(reference()) :: pos_integer()
+  def protocol_version(_ref), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Returns the maximum DAVE protocol version supported by the davey crate."
+  @spec max_protocol_version() :: pos_integer()
+  def max_protocol_version, do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Returns true if the NIF is loaded and available."
   @spec available?() :: boolean()

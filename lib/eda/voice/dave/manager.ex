@@ -123,11 +123,15 @@ defmodule EDA.Voice.Dave.Manager do
         {:ok, decrypted, manager}
 
       _ ->
-        :telemetry.execute([:eda, :voice, :dave, :frame_decrypt_error], %{count: 1}, %{
-          user_id: sender_user_id
-        })
+        if Native.can_passthrough?(session, sender_user_id) do
+          {:ok, frame, manager}
+        else
+          :telemetry.execute([:eda, :voice, :dave, :frame_decrypt_error], %{count: 1}, %{
+            user_id: sender_user_id
+          })
 
-        {:error, :decrypt_failed}
+          {:error, :decrypt_failed}
+        end
     end
   end
 
@@ -186,12 +190,13 @@ defmodule EDA.Voice.Dave.Manager do
   def handle_mls_event(%__MODULE__{mls_session: session} = manager, 27, data)
       when not is_nil(session) do
     op_type = proposal_operation_type(data["operation_type"])
+    user_ids = connected_clients_to_ids(data["connected_clients"])
 
     with {:ok, proposals} <- raw_or_base64(data, "proposals_bin", "proposals"),
          {:process_proposals, {:ok, commit, welcome}} <-
            {:process_proposals,
             normalize_process_proposals_result(
-              Native.process_proposals(session, op_type, proposals)
+              Native.process_proposals(session, op_type, proposals, user_ids)
             )} do
       proposals_reply(manager, commit, welcome)
     else
@@ -239,13 +244,20 @@ defmodule EDA.Voice.Dave.Manager do
         Logger.error("DAVE: Missing/invalid welcome payload (#{inspect(reason)})")
         {manager, []}
 
-      {:process_welcome, :error, detail} ->
-        Logger.error("DAVE: Failed to process welcome attempts=#{inspect(detail)}")
-        {manager, []}
+      {:process_welcome, :error, _detail} ->
+        # Welcome unprocessable — signal gateway to remove and re-add us.
+        Logger.warning("DAVE: Welcome failed, sending invalid_commit_welcome for recovery")
+        recover_from_failed_welcome(manager, transition_id)
     end
   end
 
   # OP 21: DAVE_PREPARE_TRANSITION
+  def handle_mls_event(manager, 21, %{"transition_id" => 0} = data) do
+    # transition_id == 0 means boot-time, execute immediately
+    Logger.debug("DAVE: Prepare transition (boot), version=#{data["protocol_version"]}")
+    {manager, [Payload.dave_ready_for_transition(0)]}
+  end
+
   def handle_mls_event(manager, 21, data) do
     Logger.debug("DAVE: Prepare transition, version=#{data["protocol_version"]}")
     {manager, []}
@@ -258,6 +270,23 @@ defmodule EDA.Voice.Dave.Manager do
   end
 
   # OP 24: DAVE_PREPARE_EPOCH
+  # epoch=1 means sole member reset — must reset group and send new key package
+  def handle_mls_event(%__MODULE__{mls_session: session} = manager, 24, %{"epoch" => 1})
+      when not is_nil(session) do
+    Logger.info("DAVE: Prepare epoch 1 (sole member reset), resetting group")
+    Native.reset(session)
+
+    case normalize_key_package_result(Native.create_key_package(session)) do
+      {:ok, key_package} ->
+        Logger.debug("DAVE: Sending new key package after epoch=1 reset")
+        {manager, [Payload.dave_mls_key_package(key_package)]}
+
+      _ ->
+        Logger.error("DAVE: Failed to create key package after epoch=1 reset")
+        {manager, []}
+    end
+  end
+
   def handle_mls_event(manager, 24, data) do
     Logger.debug("DAVE: Prepare epoch #{data["epoch"]}")
     {manager, []}
@@ -280,8 +309,14 @@ defmodule EDA.Voice.Dave.Manager do
       "DAVE: Processing welcome transition_id=#{transition_id} size=#{byte_size(welcome)}"
     )
 
-    {status, detail} = process_welcome_candidates(session, welcome)
-    {:process_welcome, status, detail}
+    raw_result = process_welcome_with_timeout(session, welcome)
+    status = normalize_atom_result(raw_result)
+
+    if status == :ok do
+      {:process_welcome, :ok, raw_result}
+    else
+      {:process_welcome, :error, %{raw: raw_result, status: status}}
+    end
   end
 
   defp announce_transition_ready(manager, session, transition_id, action) do
@@ -335,6 +370,17 @@ defmodule EDA.Voice.Dave.Manager do
         {:error, :missing_payload}
     end
   end
+
+  defp connected_clients_to_ids(%MapSet{} = clients) do
+    Enum.map(clients, fn id ->
+      case Integer.parse(to_string(id)) do
+        {int, ""} -> int
+        _ -> 0
+      end
+    end)
+  end
+
+  defp connected_clients_to_ids(_), do: []
 
   defp normalize_integer(value, _fallback) when is_integer(value), do: value
 
@@ -392,28 +438,28 @@ defmodule EDA.Voice.Dave.Manager do
   defp normalize_epoch_result(epoch) when is_integer(epoch), do: epoch
   defp normalize_epoch_result(_), do: 0
 
-  defp process_welcome_candidates(session, welcome_payload) do
-    candidates =
-      case welcome_payload do
-        <<_tid::16-big, rest::binary>> ->
-          [rest, welcome_payload]
+  defp recover_from_failed_welcome(manager, transition_id) do
+    session = manager.mls_session
+
+    # Per Discord docs: send OP 31, reset state, send new key package.
+    # The gateway will remove and re-add us with a fresh welcome.
+    Native.reset(session)
+
+    replies = [Payload.dave_mls_invalid_commit_welcome(transition_id)]
+
+    # Send a fresh key package so the gateway can re-add us
+    replies =
+      case normalize_key_package_result(Native.create_key_package(session)) do
+        {:ok, key_package} ->
+          Logger.info("DAVE: Recovery — sending invalid_commit_welcome + new key package")
+          replies ++ [Payload.dave_mls_key_package(key_package)]
 
         _ ->
-          [welcome_payload]
+          Logger.info("DAVE: Recovery — sending invalid_commit_welcome (no key package)")
+          replies
       end
 
-    Enum.reduce_while(Enum.with_index(candidates, 1), {:error, []}, fn {candidate, idx},
-                                                                       {:error, acc} ->
-      raw_result = process_welcome_with_timeout(session, candidate)
-      status = normalize_atom_result(raw_result)
-      detail = %{candidate: idx, size: byte_size(candidate), raw: raw_result, status: status}
-
-      if status == :ok do
-        {:halt, {:ok, [detail | acc]}}
-      else
-        {:cont, {:error, [detail | acc]}}
-      end
-    end)
+    {manager, replies}
   end
 
   defp process_welcome_with_timeout(session, payload) do

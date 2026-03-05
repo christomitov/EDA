@@ -124,4 +124,14 @@ defmodule EDA.Voice.Payload do
     welcome = if is_binary(welcome_bytes), do: welcome_bytes, else: <<>>
     {:binary, <<28, commit_bytes::binary, welcome::binary>>}
   end
+
+  @doc """
+  Builds a DAVE_MLS_INVALID_COMMIT_WELCOME payload (OP 31).
+
+  Sent when the client cannot process a commit or welcome, triggering
+  the gateway to remove and re-add the member.
+  """
+  def dave_mls_invalid_commit_welcome(transition_id) do
+    %{op: 31, d: %{transition_id: transition_id}}
+  end
 end

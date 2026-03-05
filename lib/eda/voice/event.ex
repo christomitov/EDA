@@ -159,9 +159,45 @@ defmodule EDA.Voice.Event do
     {:ok, %{state | ssrc_map: new_ssrc_map}}
   end
 
+  # OP 11: CLIENTS_CONNECT — track connected voice clients for DAVE proposals
+  def handle(%{"op" => 11, "d" => %{"user_ids" => user_ids}}, state) when is_list(user_ids) do
+    ids = Enum.map(user_ids, &to_string/1)
+    new_clients = Enum.reduce(ids, state.connected_clients, &MapSet.put(&2, &1))
+    Logger.debug("DAVE: Clients connected: #{inspect(ids)}")
+    {:ok, %{state | connected_clients: new_clients}}
+  end
+
+  # OP 12: CLIENTS_DISCONNECT (batch) — remove disconnected voice clients
+  def handle(%{"op" => 12, "d" => %{"user_ids" => user_ids}}, state) when is_list(user_ids) do
+    ids = Enum.map(user_ids, &to_string/1)
+    new_clients = Enum.reduce(ids, state.connected_clients, &MapSet.delete(&2, &1))
+    Logger.debug("DAVE: Clients disconnected: #{inspect(ids)}")
+    {:ok, %{state | connected_clients: new_clients}}
+  end
+
+  # OP 13: CLIENT_DISCONNECT (single) — per DAVE spec, single user_id disconnect
+  def handle(%{"op" => 13, "d" => %{"user_id" => user_id}}, state) when not is_nil(user_id) do
+    id = to_string(user_id)
+    new_clients = MapSet.delete(state.connected_clients, id)
+    Logger.debug("DAVE: Client disconnected: #{id}")
+    {:ok, %{state | connected_clients: new_clients}}
+  end
+
+  def handle(%{"op" => 13, "d" => data}, state) do
+    Logger.debug("DAVE: Client disconnect (unhandled format): #{inspect(data)}")
+    {:ok, state}
+  end
+
   # DAVE opcodes 21-31 — delegate to Dave.Manager
   def handle(%{"op" => op, "d" => data}, %{dave_manager: %Dave.Manager{}} = state)
       when op in 21..31 do
+    data =
+      if op == 27 do
+        Map.put(data, "connected_clients", state.connected_clients)
+      else
+        data
+      end
+
     {updated_manager, replies} = Dave.Manager.handle_mls_event(state.dave_manager, op, data)
     new_state = %{state | dave_manager: updated_manager}
 
@@ -174,8 +210,16 @@ defmodule EDA.Voice.Event do
     end
 
     case replies do
-      [payload | _rest] -> {:reply, payload, new_state}
-      [] -> {:ok, new_state}
+      [first | rest] ->
+        # Send additional payloads directly (WebSockex only replies with one frame)
+        Enum.each(rest, fn payload ->
+          EDA.Voice.Session.send_payload(state.guild_id, payload)
+        end)
+
+        {:reply, first, new_state}
+
+      [] ->
+        {:ok, new_state}
     end
   end
 
