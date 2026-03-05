@@ -13,7 +13,8 @@ defmodule EDA.Voice.Payload do
   @doc """
   Builds an IDENTIFY payload for voice gateway authentication.
 
-  When `dave_version` is > 0, includes DAVE protocol negotiation.
+  When `dave_version` is > 0, includes DAVE protocol negotiation using
+  `max_dave_protocol_version`.
   """
   def identify(server_id, user_id, session_id, token, dave_version \\ 0) do
     d = %{
@@ -25,7 +26,7 @@ defmodule EDA.Voice.Payload do
 
     d =
       if dave_version > 0 do
-        Map.put(d, :dave, %{protocol_version: dave_version})
+        Map.put(d, :max_dave_protocol_version, dave_version)
       else
         d
       end
@@ -97,10 +98,11 @@ defmodule EDA.Voice.Payload do
   @doc """
   Builds a DAVE_MLS_KEY_PACKAGE payload (OP 26).
 
-  Sends this client's MLS key package to the voice gateway.
+  Per DAVE spec this opcode is sent as a binary frame:
+  `<<26, mls_key_package::binary>>`.
   """
   def dave_mls_key_package(key_package_bytes) do
-    %{op: 26, d: %{key_package: Base.encode64(key_package_bytes)}}
+    {:binary, <<26, key_package_bytes::binary>>}
   end
 
   @doc """
@@ -115,18 +117,11 @@ defmodule EDA.Voice.Payload do
   @doc """
   Builds a DAVE_MLS_COMMIT_WELCOME payload (OP 28).
 
-  Sends the MLS commit (and optional welcome) to the gateway after processing proposals.
+  Per DAVE spec this opcode is sent as a binary frame:
+  `<<28, commit::binary, welcome::binary>>` where welcome is optional.
   """
   def dave_mls_commit_welcome(commit_bytes, welcome_bytes \\ nil) do
-    d = %{commit: Base.encode64(commit_bytes)}
-
-    d =
-      if welcome_bytes do
-        Map.put(d, :welcome, Base.encode64(welcome_bytes))
-      else
-        d
-      end
-
-    %{op: 28, d: d}
+    welcome = if is_binary(welcome_bytes), do: welcome_bytes, else: <<>>
+    {:binary, <<28, commit_bytes::binary, welcome::binary>>}
   end
 end

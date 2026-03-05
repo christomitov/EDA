@@ -51,11 +51,10 @@ defmodule EDA.Voice.Dave.Native do
   Processes MLS proposals from the gateway.
 
   `operation_type` is `:append` or `:revoke`.
-  Returns `{:ok, commit_binary, :ok | :nil}` where the third element indicates
-  whether a welcome message was generated.
+  Returns `{:ok, commit_binary, welcome_binary_or_nil}`.
   """
   @spec process_proposals(reference(), :append | :revoke, binary()) ::
-          {:ok, binary(), :ok | nil}
+          {:ok, binary(), binary() | nil}
   def process_proposals(_ref, _operation_type, _proposals),
     do: :erlang.nif_error(:nif_not_loaded)
 
@@ -67,8 +66,13 @@ defmodule EDA.Voice.Dave.Native do
   @spec process_welcome(reference(), binary()) :: :ok | :error
   def process_welcome(_ref, _welcome), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc "Encrypts an Opus audio packet using DAVE E2EE. Returns `{:ok, encrypted_binary}`."
-  @spec encrypt_opus(reference(), binary()) :: {:ok, binary()}
+  @doc """
+  Encrypts an Opus audio packet using DAVE E2EE.
+
+  Returns `{:ok, encrypted_binary}` or `{:error, :not_ready | :encryption_failed | :error}`.
+  """
+  @spec encrypt_opus(reference(), binary()) ::
+          {:ok, binary()} | {:error, :not_ready | :encryption_failed | :error}
   def encrypt_opus(_ref, _packet), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Decrypts a DAVE-encrypted audio packet. Returns `{:ok, decrypted_binary}`."

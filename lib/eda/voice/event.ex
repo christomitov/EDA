@@ -73,7 +73,11 @@ defmodule EDA.Voice.Event do
     # SESSION_DESCRIPTION - we have the secret key, voice is ready!
     secret_key = data["secret_key"] |> :erlang.list_to_binary()
     mode = data["mode"]
-    dave_version = get_in(data, ["dave", "protocol_version"]) || 0
+
+    dave_version =
+      get_in(data, ["dave", "protocol_version"]) ||
+        data["dave_protocol_version"] ||
+        0
 
     Logger.info(
       "Voice session established, encryption: #{mode}" <>
@@ -87,9 +91,10 @@ defmodule EDA.Voice.Event do
       if dave_version > 0 do
         me = EDA.Cache.me()
         user_id = String.to_integer(me["id"])
+        channel_id = String.to_integer(state.channel_id)
 
         dave_manager =
-          Dave.Manager.new(dave_version, user_id, String.to_integer(state.guild_id))
+          Dave.Manager.new(dave_version, user_id, channel_id)
 
         %{new_state | dave_manager: dave_manager}
       else
@@ -107,7 +112,20 @@ defmodule EDA.Voice.Event do
       "channel_id" => state.channel_id
     })
 
-    {:ok, new_state}
+    # Per DAVE flow, send our key package after SESSION_DESCRIPTION indicates
+    # DAVE support. We still also handle OP25-triggered key package sends.
+    if dave_version > 0 do
+      case Dave.Manager.key_package_payload(new_state.dave_manager) do
+        {:ok, payload} ->
+          Logger.debug("DAVE: Sending initial MLS key package after SESSION_DESCRIPTION")
+          {:reply, payload, new_state}
+
+        :error ->
+          {:ok, new_state}
+      end
+    else
+      {:ok, new_state}
+    end
   end
 
   def handle(%{"op" => 6}, state) do

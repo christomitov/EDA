@@ -64,6 +64,17 @@ defmodule EDA.Voice.Dave.Manager do
   @spec active?(t()) :: boolean()
   def active?(%__MODULE__{protocol_version: v, mls_session: s}), do: v > 0 and not is_nil(s)
 
+  @doc "Returns true when the MLS session is ready to encrypt media."
+  @spec ready?(t()) :: boolean()
+  def ready?(%__MODULE__{mls_session: nil}), do: false
+
+  def ready?(%__MODULE__{mls_session: session}) do
+    case normalize_ready_result(Native.ready?(session)) do
+      {:ok, ready} -> ready
+      _ -> false
+    end
+  end
+
   @doc """
   Encrypts an Opus frame through DAVE E2EE.
 
@@ -76,9 +87,17 @@ defmodule EDA.Voice.Dave.Manager do
   end
 
   def encrypt_frame(%__MODULE__{mls_session: session} = manager, opus_frame) do
-    case Native.encrypt_opus(session, opus_frame) do
+    case normalize_encrypt_result(Native.encrypt_opus(session, opus_frame)) do
       {:ok, encrypted} ->
         {encrypted, manager}
+
+      {:error, :not_ready} ->
+        Logger.debug("DAVE: encrypt_opus not ready, sending unencrypted")
+        {opus_frame, manager}
+
+      {:error, reason} ->
+        Logger.debug("DAVE: encrypt_opus failed (#{inspect(reason)}), sending unencrypted")
+        {opus_frame, manager}
 
       _ ->
         Logger.debug("DAVE: encrypt_opus failed, sending unencrypted")
@@ -99,7 +118,7 @@ defmodule EDA.Voice.Dave.Manager do
   end
 
   def decrypt_frame(%__MODULE__{mls_session: session} = manager, frame, sender_user_id) do
-    case Native.decrypt_audio(session, sender_user_id, frame) do
+    case normalize_decrypt_result(Native.decrypt_audio(session, sender_user_id, frame)) do
       {:ok, decrypted} ->
         {:ok, decrypted, manager}
 
@@ -109,6 +128,24 @@ defmodule EDA.Voice.Dave.Manager do
         })
 
         {:error, :decrypt_failed}
+    end
+  end
+
+  @doc """
+  Builds an OP26 key package payload from the current MLS session.
+
+  Returns `{:ok, payload}` when available, otherwise `:error`.
+  """
+  @spec key_package_payload(t()) :: {:ok, term()} | :error
+  def key_package_payload(%__MODULE__{mls_session: nil}), do: :error
+
+  def key_package_payload(%__MODULE__{mls_session: session}) do
+    case normalize_key_package_result(Native.create_key_package(session)) do
+      {:ok, key_package} ->
+        {:ok, Payload.dave_mls_key_package(key_package)}
+
+      _ ->
+        :error
     end
   end
 
@@ -123,23 +160,24 @@ defmodule EDA.Voice.Dave.Manager do
   # OP 25: DAVE_MLS_EXTERNAL_SENDER
   def handle_mls_event(%__MODULE__{mls_session: session} = manager, 25, data)
       when not is_nil(session) do
-    credential = Base.decode64!(data["external_sender"])
-
-    case Native.set_external_sender(session, credential) do
-      :ok ->
-        Logger.debug("DAVE: External sender set")
-        # After setting external sender, send our key package
-        case Native.create_key_package(session) do
-          {:ok, key_package} ->
-            {manager, [Payload.dave_mls_key_package(key_package)]}
-
-          _ ->
-            Logger.error("DAVE: Failed to create key package")
-            {manager, []}
-        end
+    with {:ok, credential} <- raw_or_base64(data, "external_sender_bin", "external_sender"),
+         :ok <- Native.set_external_sender(session, credential),
+         {:key_package, {:ok, key_package}} <-
+           {:key_package, normalize_key_package_result(Native.create_key_package(session))} do
+      Logger.debug("DAVE: External sender set")
+      Logger.debug("DAVE: Sending MLS key package (#{byte_size(key_package)} bytes)")
+      {manager, [Payload.dave_mls_key_package(key_package)]}
+    else
+      {:error, reason} ->
+        Logger.error("DAVE: Missing/invalid external sender payload (#{inspect(reason)})")
+        {manager, []}
 
       :error ->
         Logger.error("DAVE: Failed to set external sender")
+        {manager, []}
+
+      {:key_package, {:error, reason}} ->
+        Logger.error("DAVE: Failed to create key package: #{inspect(reason)}")
         {manager, []}
     end
   end
@@ -147,25 +185,22 @@ defmodule EDA.Voice.Dave.Manager do
   # OP 27: DAVE_MLS_PROPOSALS
   def handle_mls_event(%__MODULE__{mls_session: session} = manager, 27, data)
       when not is_nil(session) do
-    proposals = Base.decode64!(data["proposals"])
+    op_type = proposal_operation_type(data["operation_type"])
 
-    op_type =
-      case data["operation_type"] do
-        1 -> :revoke
-        _ -> :append
-      end
-
-    case Native.process_proposals(session, op_type, proposals) do
-      {:ok, commit, _has_welcome} when byte_size(commit) > 0 ->
-        Logger.debug("DAVE: Proposals processed, sending commit")
-        {manager, [Payload.dave_mls_commit_welcome(commit, nil)]}
-
-      {:ok, _empty, _} ->
-        Logger.debug("DAVE: Proposals processed, no commit needed")
+    with {:ok, proposals} <- raw_or_base64(data, "proposals_bin", "proposals"),
+         {:process_proposals, {:ok, commit, welcome}} <-
+           {:process_proposals,
+            normalize_process_proposals_result(
+              Native.process_proposals(session, op_type, proposals)
+            )} do
+      proposals_reply(manager, commit, welcome)
+    else
+      {:error, reason} ->
+        Logger.error("DAVE: Missing/invalid proposals payload (#{inspect(reason)})")
         {manager, []}
 
-      _ ->
-        Logger.error("DAVE: Failed to process proposals")
+      {:process_proposals, {:error, reason}} ->
+        Logger.error("DAVE: Failed to process proposals: #{inspect(reason)}")
         {manager, []}
     end
   end
@@ -173,21 +208,20 @@ defmodule EDA.Voice.Dave.Manager do
   # OP 29: DAVE_MLS_ANNOUNCE_COMMIT
   def handle_mls_event(%__MODULE__{mls_session: session} = manager, 29, data)
       when not is_nil(session) do
-    commit = Base.decode64!(data["commit"])
-    transition_id = data["transition_id"]
+    transition_id = normalize_integer(data["transition_id"], 0)
 
-    case Native.process_commit(session, commit) do
-      :ok ->
-        epoch = Native.get_epoch(session)
-        Logger.info("DAVE: Commit processed, epoch=#{epoch}")
+    with {:ok, commit} <- raw_or_base64(data, "commit_bin", "commit"),
+         raw_result <- Native.process_commit(session, commit),
+         {:process_commit, :ok, _} <-
+           {:process_commit, normalize_atom_result(raw_result), raw_result} do
+      announce_transition_ready(manager, session, transition_id, "Commit processed")
+    else
+      {:error, reason} ->
+        Logger.error("DAVE: Missing/invalid commit payload (#{inspect(reason)})")
+        {manager, []}
 
-        :telemetry.execute([:eda, :voice, :dave, :epoch_change], %{epoch: epoch}, %{})
-
-        manager = %{manager | transition_id: transition_id, pending_epoch: epoch}
-        {manager, [Payload.dave_ready_for_transition(transition_id)]}
-
-      :error ->
-        Logger.error("DAVE: Failed to process commit")
+      {:process_commit, :error, raw_result} ->
+        Logger.error("DAVE: Failed to process commit result=#{inspect(raw_result)}")
         {manager, []}
     end
   end
@@ -195,21 +229,18 @@ defmodule EDA.Voice.Dave.Manager do
   # OP 30: DAVE_MLS_WELCOME
   def handle_mls_event(%__MODULE__{mls_session: session} = manager, 30, data)
       when not is_nil(session) do
-    welcome = Base.decode64!(data["welcome"])
+    transition_id = normalize_integer(data["transition_id"], 0)
 
-    case Native.process_welcome(session, welcome) do
-      :ok ->
-        epoch = Native.get_epoch(session)
-        transition_id = data["transition_id"]
-        Logger.info("DAVE: Welcome processed, epoch=#{epoch}")
+    with {:ok, welcome} <- raw_or_base64(data, "welcome_bin", "welcome"),
+         {:process_welcome, :ok, _detail} <- process_welcome(session, transition_id, welcome) do
+      announce_transition_ready(manager, session, transition_id, "Welcome processed")
+    else
+      {:error, reason} ->
+        Logger.error("DAVE: Missing/invalid welcome payload (#{inspect(reason)})")
+        {manager, []}
 
-        :telemetry.execute([:eda, :voice, :dave, :epoch_change], %{epoch: epoch}, %{})
-
-        manager = %{manager | transition_id: transition_id, pending_epoch: epoch}
-        {manager, [Payload.dave_ready_for_transition(transition_id)]}
-
-      :error ->
-        Logger.error("DAVE: Failed to process welcome")
+      {:process_welcome, :error, detail} ->
+        Logger.error("DAVE: Failed to process welcome attempts=#{inspect(detail)}")
         {manager, []}
     end
   end
@@ -222,7 +253,7 @@ defmodule EDA.Voice.Dave.Manager do
 
   # OP 22: DAVE_EXECUTE_TRANSITION
   def handle_mls_event(manager, 22, _data) do
-    Logger.info("DAVE: Execute transition, epoch=#{manager.pending_epoch}")
+    Logger.info("DAVE: Execute transition, epoch=#{inspect(manager.pending_epoch)}")
     {%{manager | pending_epoch: nil, transition_id: nil}, []}
   end
 
@@ -242,5 +273,155 @@ defmodule EDA.Voice.Dave.Manager do
   def handle_mls_event(manager, opcode, _data) do
     Logger.debug("DAVE: Unhandled MLS opcode #{opcode}")
     {manager, []}
+  end
+
+  defp process_welcome(session, transition_id, welcome) do
+    Logger.debug(
+      "DAVE: Processing welcome transition_id=#{transition_id} size=#{byte_size(welcome)}"
+    )
+
+    {status, detail} = process_welcome_candidates(session, welcome)
+    {:process_welcome, status, detail}
+  end
+
+  defp announce_transition_ready(manager, session, transition_id, action) do
+    epoch = normalize_epoch_result(Native.get_epoch(session))
+    Logger.info("DAVE: #{action}, epoch=#{epoch}")
+
+    :telemetry.execute([:eda, :voice, :dave, :epoch_change], %{epoch: epoch}, %{})
+
+    manager = %{manager | transition_id: transition_id, pending_epoch: epoch}
+    {manager, [Payload.dave_ready_for_transition(transition_id)]}
+  end
+
+  defp proposal_operation_type(operation_type) do
+    case normalize_integer(operation_type, 0) do
+      1 -> :revoke
+      _ -> :append
+    end
+  end
+
+  defp proposals_reply(manager, commit, welcome) when byte_size(commit) > 0 do
+    Logger.debug(
+      "DAVE: Proposals processed, sending commit (#{byte_size(commit)} bytes)" <>
+        welcome_log_suffix(welcome)
+    )
+
+    {manager, [Payload.dave_mls_commit_welcome(commit, welcome)]}
+  end
+
+  defp proposals_reply(manager, _commit, _welcome) do
+    Logger.debug("DAVE: Proposals processed, no commit needed")
+    {manager, []}
+  end
+
+  defp welcome_log_suffix(welcome) when is_binary(welcome),
+    do: " + welcome (#{byte_size(welcome)} bytes)"
+
+  defp welcome_log_suffix(_welcome), do: ""
+
+  defp raw_or_base64(data, raw_key, base64_key) do
+    cond do
+      is_binary(data[raw_key]) ->
+        {:ok, data[raw_key]}
+
+      is_binary(data[base64_key]) ->
+        case Base.decode64(data[base64_key]) do
+          {:ok, decoded} -> {:ok, decoded}
+          :error -> {:error, :invalid_base64}
+        end
+
+      true ->
+        {:error, :missing_payload}
+    end
+  end
+
+  defp normalize_integer(value, _fallback) when is_integer(value), do: value
+
+  defp normalize_integer(value, fallback) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} -> parsed
+      _ -> fallback
+    end
+  end
+
+  defp normalize_integer(_value, fallback), do: fallback
+
+  defp normalize_key_package_result({:ok, key_package}) when is_binary(key_package),
+    do: {:ok, key_package}
+
+  defp normalize_key_package_result({:ok, {:ok, key_package}}) when is_binary(key_package),
+    do: {:ok, key_package}
+
+  defp normalize_key_package_result(other), do: {:error, other}
+
+  defp normalize_process_proposals_result({:ok, commit, welcome})
+       when is_binary(commit) and (is_binary(welcome) or is_nil(welcome)),
+       do: {:ok, commit, welcome}
+
+  defp normalize_process_proposals_result({:ok, {:ok, commit, welcome}})
+       when is_binary(commit) and (is_binary(welcome) or is_nil(welcome)),
+       do: {:ok, commit, welcome}
+
+  defp normalize_process_proposals_result(other), do: {:error, other}
+
+  defp normalize_encrypt_result({:ok, encrypted}) when is_binary(encrypted), do: {:ok, encrypted}
+
+  defp normalize_encrypt_result({:ok, {:ok, encrypted}}) when is_binary(encrypted),
+    do: {:ok, encrypted}
+
+  defp normalize_encrypt_result({:error, reason}), do: {:error, reason}
+  defp normalize_encrypt_result(other), do: {:error, other}
+
+  defp normalize_decrypt_result({:ok, decrypted}) when is_binary(decrypted), do: {:ok, decrypted}
+
+  defp normalize_decrypt_result({:ok, {:ok, decrypted}}) when is_binary(decrypted),
+    do: {:ok, decrypted}
+
+  defp normalize_decrypt_result(other), do: {:error, other}
+
+  defp normalize_ready_result({:ok, ready}) when is_boolean(ready), do: {:ok, ready}
+  defp normalize_ready_result(ready) when is_boolean(ready), do: {:ok, ready}
+  defp normalize_ready_result(other), do: {:error, other}
+
+  defp normalize_atom_result({:ok, atom}) when is_atom(atom), do: atom
+  defp normalize_atom_result(atom) when is_atom(atom), do: atom
+  defp normalize_atom_result(_), do: :error
+
+  defp normalize_epoch_result({:ok, epoch}) when is_integer(epoch), do: epoch
+  defp normalize_epoch_result(epoch) when is_integer(epoch), do: epoch
+  defp normalize_epoch_result(_), do: 0
+
+  defp process_welcome_candidates(session, welcome_payload) do
+    candidates =
+      case welcome_payload do
+        <<_tid::16-big, rest::binary>> ->
+          [rest, welcome_payload]
+
+        _ ->
+          [welcome_payload]
+      end
+
+    Enum.reduce_while(Enum.with_index(candidates, 1), {:error, []}, fn {candidate, idx},
+                                                                       {:error, acc} ->
+      raw_result = process_welcome_with_timeout(session, candidate)
+      status = normalize_atom_result(raw_result)
+      detail = %{candidate: idx, size: byte_size(candidate), raw: raw_result, status: status}
+
+      if status == :ok do
+        {:halt, {:ok, [detail | acc]}}
+      else
+        {:cont, {:error, [detail | acc]}}
+      end
+    end)
+  end
+
+  defp process_welcome_with_timeout(session, payload) do
+    task = Task.async(fn -> Native.process_welcome(session, payload) end)
+
+    case Task.yield(task, 2_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      nil -> :timeout
+    end
   end
 end

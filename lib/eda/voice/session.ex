@@ -90,6 +90,12 @@ defmodule EDA.Voice.Session do
   """
   def send_payload(guild_id, payload) do
     WebSockex.cast(via(guild_id), {:send_payload, payload})
+  rescue
+    ArgumentError ->
+      {:error, :not_connected}
+  catch
+    :exit, _ ->
+      {:error, :not_connected}
   end
 
   @doc """
@@ -135,13 +141,16 @@ defmodule EDA.Voice.Session do
     {:ok, %{state | ready: false, udp_socket: nil, secret_key: nil}}
   end
 
-  # 4014 → bot was disconnected from voice (kicked by admin, channel deleted, etc.)
+  # 4014 → bot was disconnected from voice. Attempt a bounded restart/rejoin
+  # through EDA.Voice state management.
   def handle_disconnect(%{reason: {:remote, code, _msg}}, state)
       when code in @disconnect_close_codes do
-    Logger.info("Voice session ended for guild #{state.guild_id} (disconnected)")
+    Logger.warning(
+      "Voice session ended for guild #{state.guild_id} with 4014 (disconnected), attempting restart"
+    )
 
     cleanup_state(state)
-    EDA.Voice.voice_disconnected(state.guild_id)
+    EDA.Voice.restart_session(state.guild_id)
     {:ok, %{state | ready: false, udp_socket: nil, secret_key: nil}}
   end
 
@@ -174,6 +183,41 @@ defmodule EDA.Voice.Session do
     |> handle_event_result()
   end
 
+  # Binary DAVE control frames (v8):
+  # <<sequence::16, opcode::8, payload::binary>>
+  def handle_frame({:binary, <<seq::16-big, op::8, payload::binary>>}, state)
+      when op in [25, 27, 29, 30] do
+    new_state = %{state | seq_ack: max(state.seq_ack, seq)}
+
+    dave_data =
+      case {op, payload} do
+        {25, external_sender} ->
+          %{"external_sender_bin" => external_sender}
+
+        {27, <<operation_type::8, proposals::binary>>} ->
+          %{"operation_type" => operation_type, "proposals_bin" => proposals}
+
+        {29, <<transition_id::16-big, commit::binary>>} ->
+          %{"transition_id" => transition_id, "commit_bin" => commit}
+
+        {30, welcome_payload} ->
+          transition_id =
+            case welcome_payload do
+              <<tid::16-big, _::binary>> -> tid
+              _ -> 0
+            end
+
+          %{"transition_id" => transition_id, "welcome_bin" => welcome_payload}
+
+        _ ->
+          %{}
+      end
+
+    %{"op" => op, "d" => dave_data}
+    |> Event.handle(new_state)
+    |> handle_event_result()
+  end
+
   # Binary frames with 2-byte sequence prefix (v8)
   def handle_frame({:binary, <<seq::16-big, json::binary>>}, state) do
     new_state = %{state | seq_ack: max(state.seq_ack, seq)}
@@ -193,6 +237,10 @@ defmodule EDA.Voice.Session do
   def handle_frame(_frame, state), do: {:ok, state}
 
   @impl true
+  def handle_cast({:send_payload, {:binary, payload}}, state) when is_binary(payload) do
+    {:reply, {:binary, payload}, state}
+  end
+
   def handle_cast({:send_payload, payload}, state) do
     {:reply, {:text, Jason.encode!(payload)}, state}
   end
@@ -259,6 +307,15 @@ defmodule EDA.Voice.Session do
 
   def handle_info(_msg, state), do: {:ok, state}
 
+  @impl true
+  def terminate(reason, state) do
+    Logger.warning(
+      "Voice session terminating for guild #{state.guild_id}: reason=#{inspect(reason)} ready=#{state.ready} seq_ack=#{state.seq_ack}"
+    )
+
+    :ok
+  end
+
   # Private
 
   defp handle_voice_packet(packet, state) do
@@ -298,6 +355,11 @@ defmodule EDA.Voice.Session do
 
   defp build_url(endpoint) do
     "wss://#{endpoint}/?v=8"
+  end
+
+  defp handle_event_result({:reply, {:binary, payload}, state}) when is_binary(payload) do
+    Logger.debug("Voice WS sending binary payload (#{byte_size(payload)} bytes)")
+    {:reply, {:binary, payload}, state}
   end
 
   defp handle_event_result({:reply, payload, state}) do
