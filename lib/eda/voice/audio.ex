@@ -71,10 +71,10 @@ defmodule EDA.Voice.Audio do
 
   Returns the pid of the player process.
   """
-  @spec play(String.t(), String.t() | Enumerable.t(), atom(), map()) :: pid()
-  def play(guild_id, input, type, voice_state) do
+  @spec play(String.t(), String.t() | Enumerable.t(), atom(), map(), keyword()) :: pid()
+  def play(guild_id, input, type, voice_state, opts \\ []) do
     spawn_link(fn ->
-      player_loop(guild_id, input, type, voice_state)
+      player_loop(guild_id, input, type, voice_state, opts)
     end)
   end
 
@@ -124,7 +124,7 @@ defmodule EDA.Voice.Audio do
     :ok
   end
 
-  defp player_loop(guild_id, input, :url, voice_state) do
+  defp player_loop(guild_id, input, :url, voice_state, opts) do
     record_playback_progress(
       guild_id,
       voice_state.sequence,
@@ -132,7 +132,7 @@ defmodule EDA.Voice.Audio do
       voice_state.nonce
     )
 
-    args = build_ffmpeg_args(input)
+    args = build_ffmpeg_args(input, opts)
 
     Logger.info("Starting ffmpeg: #{inspect(args)}")
 
@@ -177,7 +177,7 @@ defmodule EDA.Voice.Audio do
     EDA.Voice.playback_finished(guild_id, tail_seq, tail_ts, tail_nonce)
   end
 
-  defp player_loop(guild_id, frames, :raw, voice_state) do
+  defp player_loop(guild_id, frames, :raw, voice_state, _opts) do
     record_playback_progress(
       guild_id,
       voice_state.sequence,
@@ -456,7 +456,13 @@ defmodule EDA.Voice.Audio do
 
   # FFmpeg helpers
 
-  defp build_ffmpeg_args(input) do
+  defp build_ffmpeg_args(input, opts) do
+    volume_args =
+      case normalized_volume_option(opts) do
+        nil -> []
+        volume -> ["-af", "volume=#{volume}"]
+      end
+
     [
       "-i",
       input,
@@ -469,20 +475,41 @@ defmodule EDA.Voice.Audio do
       "-page_duration",
       "20000",
       "-map",
-      "0:a",
-      "-acodec",
-      "libopus",
-      "-b:a",
-      "128000",
-      "-frame_duration",
-      "20",
-      "-application",
-      "audio",
-      "-loglevel",
-      "warning",
-      "pipe:1"
-    ]
+      "0:a"
+    ] ++
+      volume_args ++
+      [
+        "-acodec",
+        "libopus",
+        "-b:a",
+        "128000",
+        "-frame_duration",
+        "20",
+        "-application",
+        "audio",
+        "-loglevel",
+        "warning",
+        "pipe:1"
+      ]
   end
+
+  defp normalized_volume_option(opts) do
+    case Keyword.get(opts, :volume) do
+      nil -> nil
+      value -> normalize_volume(value)
+    end
+  end
+
+  defp normalize_volume(value) when is_integer(value), do: normalize_volume(value * 1.0)
+
+  defp normalize_volume(value) when is_float(value) do
+    value
+    |> max(0.0)
+    |> Float.round(4)
+    |> :erlang.float_to_binary(decimals: 4)
+  end
+
+  defp normalize_volume(_), do: "1.0000"
 
   defp ffmpeg_path do
     System.find_executable("ffmpeg") || "ffmpeg"
