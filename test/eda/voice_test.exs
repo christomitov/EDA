@@ -27,9 +27,14 @@ defmodule EDA.VoiceTest do
     end
   end
 
-  describe "play/3" do
+  describe "play/3 and play/4" do
     test "returns error when not connected" do
       assert {:error, :not_connected} = EDA.Voice.play("unknown_guild", "test.mp3")
+    end
+
+    test "accepts playback opts when not connected" do
+      assert {:error, :not_connected} =
+               EDA.Voice.play("unknown_guild", "test.mp3", :url, volume: 0.5)
     end
   end
 
