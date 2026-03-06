@@ -43,3 +43,5 @@ native/*/target/
 # Claude Code
 .claude/
 
+/DAVE_ROADMAP.md
+/FEATURE_GAP.md

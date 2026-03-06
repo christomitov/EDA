@@ -52,9 +52,15 @@ defmodule EDA.Voice.Dave.ManagerTest do
       assert replies == []
     end
 
-    test "OP 24 (PREPARE_EPOCH) returns no replies" do
+    test "OP 24 (PREPARE_EPOCH) epoch=1 resets and sends key package" do
       manager = Manager.new(1, 12_345, 67_890)
       {_manager, replies} = Manager.handle_mls_event(manager, 24, %{"epoch" => 1})
+      assert [{:binary, <<26, _::binary>>}] = replies
+    end
+
+    test "OP 24 (PREPARE_EPOCH) epoch!=1 returns no replies" do
+      manager = Manager.new(1, 12_345, 67_890)
+      {_manager, replies} = Manager.handle_mls_event(manager, 24, %{"epoch" => 2})
       assert replies == []
     end
 
